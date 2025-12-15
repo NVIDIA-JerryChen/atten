@@ -187,6 +187,40 @@ def test_flash_attn_output(
         dv_vals = [d]
     if has_qv:
         dv_vals = [256, 512]
+
+    import numpy as np
+    import functools
+
+    # ratio = 1.0
+    # ratio = 0.2
+    ratio = 0.9
+    num_k_blocks = (seqlen_k - 1) // 16 + 1
+    top_k_blocks = (int(seqlen_k * ratio) - 1) // 16 + 1
+    indices_shape = (batch_size, nheads, (seqlen_q - 1) // 16 + 1)
+    num = functools.reduce(lambda x, y: x * y, indices_shape)
+
+    block_sparse_indices = np.arange(num_k_blocks, dtype=np.int32)
+    block_sparse_indices = np.ascontiguousarray(np.tile(block_sparse_indices, (num,1))).swapaxes(0, -1)
+    for i in range(num):
+        np.random.shuffle(block_sparse_indices[:, i])
+    block_sparse_indices = block_sparse_indices[:top_k_blocks].swapaxes(0, -1)
+    block_sparse_indices = np.sort(block_sparse_indices, axis=-1)
+    block_sparse_indices = block_sparse_indices.reshape(*indices_shape, top_k_blocks)
+    block_sparse_indices = torch.from_numpy(block_sparse_indices).to(device)
+    # print(block_sparse_indices)
+    print("block_sparse_indices:", block_sparse_indices.shape)
+
+    block_sparse_mask = torch.zeros(*indices_shape, num_k_blocks, device=device, dtype=torch.float32)
+    block_sparse_mask.scatter_(-1, block_sparse_indices, 1.0)
+
+    block_sparse_bias = (block_sparse_mask - 1.0) * 1e9
+    block_sparse_bias = block_sparse_bias.repeat_interleave(16, dim=-1)
+    block_sparse_bias = block_sparse_bias.repeat_interleave(16, dim=-2)
+    # print(block_sparse_bias)
+    print("block_sparse_bias:", block_sparse_bias.shape)
+
+    print("ratio:", ratio)
+
     attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if not DISABLE_LOCAL else [0]
     for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
         print(f"{dv = }, {attention_chunk = }")
@@ -218,6 +252,7 @@ def test_flash_attn_output(
             v_ref,
             None,
             None,
+            attn_bias=block_sparse_bias,
             causal=causal,
             qv=qv_ref,
             q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
@@ -231,6 +266,7 @@ def test_flash_attn_output(
             v_ref,
             None,
             None,
+            attn_bias=block_sparse_bias,
             causal=causal,
             qv=qv_ref,
             q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
@@ -268,6 +304,9 @@ def test_flash_attn_output(
                 q,
                 k,
                 v,
+                block_sparse_indices,
+                block_sparse_blocksize_m=16,
+                block_sparse_blocksize_n=16,
                 causal=causal,
                 qv=qv,
                 q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
@@ -288,9 +327,9 @@ def test_flash_attn_output(
             assert (out - out_ref).abs().max().item() <= rtol * (out_pt - out_ref).abs().max().item() + fwd_atol
 
         if (
-            not DISABLE_BACKWARD 
-            and dtype != torch.float8_e4m3fn 
-            and not V_colmajor 
+            not DISABLE_BACKWARD
+            and dtype != torch.float8_e4m3fn
+            and not V_colmajor
             and not has_qv
             and not dv > 256
             and not attention_chunk != 0
@@ -422,7 +461,7 @@ def test_flash_attn_varlen_output(
     # batch_size = 2
     # nheads = 1
     # nheads_kv = nheads
-    
+
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     if dtype == torch.float8_e4m3fn:
@@ -586,8 +625,8 @@ def test_flash_attn_varlen_output(
 
 
         if (
-            not DISABLE_BACKWARD 
-            and dtype != torch.float8_e4m3fn 
+            not DISABLE_BACKWARD
+            and dtype != torch.float8_e4m3fn
             and not has_qv
             and not dv > 256
             and not attention_chunk != 0

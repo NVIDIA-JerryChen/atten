@@ -81,6 +81,9 @@ struct Flash_fwd_params : public Qkv_params {
     int *__restrict__ seqused_q;
     int *__restrict__ seqused_k;
 
+    int *__restrict__ block_sparse_indices;
+    int block_sparse_topk;
+
     // The stride between rows of Oaccum.
     index_t oaccum_split_stride;
     index_t oaccum_batch_stride;
