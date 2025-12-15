@@ -43,6 +43,10 @@ FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
+# Force only SM80 build (PTX + SASS) for debugging on newer GPUs.
+FORCE_SM80_ONLY = os.getenv("FLASH_ATTENTION_FORCE_SM80_ONLY", "FALSE") == "TRUE"
+# Optionally drop SM90 kernels from the build.
+DISABLE_SM90 = os.getenv("FLASH_ATTENTION_DISABLE_SM90", "FALSE") == "TRUE"
 
 DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE") == "TRUE"
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
@@ -483,8 +487,19 @@ if not SKIP_CUDA_BUILD:
         os.chmod(nvcc_path_new, os.stat(nvcc_path_new).st_mode | stat.S_IEXEC)
 
     cc_flag = []
-    cc_flag.append("-gencode")
-    cc_flag.append("arch=compute_90a,code=sm_90a")
+    if FORCE_SM80_ONLY:
+        # Build only SM80 (with PTX for forward-compat JIT on newer GPUs)
+        cc_flag.extend([
+            "-gencode", "arch=compute_80,code=sm_80",
+            "-gencode", "arch=compute_80,code=compute_80",
+        ])
+    else:
+        # Default: keep SM90a and also emit SM80 PTX+SASS so SM80 kernels can JIT on H100
+        cc_flag.extend([
+            "-gencode", "arch=compute_90a,code=sm_90a",
+            "-gencode", "arch=compute_80,code=sm_80",
+            "-gencode", "arch=compute_80,code=compute_80",
+        ])
 
     # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
     # torch._C._GLIBCXX_USE_CXX11_ABI
@@ -572,20 +587,16 @@ if not SKIP_CUDA_BUILD:
         sources_bwd_sm80 = []
     
     # Choose between flash_api.cpp and flash_api_stable.cpp based on torch version
-    torch_version = parse(torch.__version__)
-    target_version = parse("2.9.0.dev20250830")
+    # Do not use stable version
+    flash_api_source = "flash_api.cpp"
     stable_args = []
-      
-    if torch_version >= target_version:
-        flash_api_source = "flash_api_stable.cpp"
-        stable_args = ["-DTORCH_STABLE_ONLY"]  # Checks against including unstable Tensor APIs
-    else:
-        flash_api_source = "flash_api.cpp"
 
     sources = (
         [flash_api_source]
-        + (sources_fwd_sm80 if not DISABLE_SM8x else []) + sources_fwd_sm90
-        + (sources_bwd_sm80 if not DISABLE_SM8x else []) + sources_bwd_sm90
+        + (sources_fwd_sm80 if not DISABLE_SM8x else [])
+        + ([] if DISABLE_SM90 else sources_fwd_sm90)
+        + (sources_bwd_sm80 if not DISABLE_SM8x else [])
+        + ([] if DISABLE_SM90 else sources_bwd_sm90)
     )
     if not DISABLE_SPLIT:
         sources += ["flash_fwd_combine.cu"]

@@ -45,6 +45,7 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr bool PackGQA = PackGQA_;
     static constexpr bool Split = Split_;
     static constexpr bool Transpose_V = Is_FP8;
+    static constexpr bool Is_sparse = true;
 
     static_assert(ArchTag::kMinComputeCapability >= 80);
 
@@ -53,6 +54,7 @@ struct CollectiveMainloopFwdSm80 {
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
+    static constexpr int kBlockSparse = 16;
 
     using SeqlenInfo_t = flash::SeqlenInfoQKNewK<Varlen, AppendKV>;
     using BlockMN_t = flash::BlockMN<SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local, PackGQA, Split>;
@@ -101,6 +103,15 @@ struct CollectiveMainloopFwdSm80 {
                     make_ordered_layout(make_shape(shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{}), Int<kStages>{}),
                                         Step<_2, _1, _3>{})));
 
+    using SmemLayoutK_Sparse = decltype(tile_to_shape(
+        SmemLayoutAtomQKV{},
+        make_shape(kBlockSparse, shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})/kBlockSparse, Int<kStages>{})));
+    using SmemLayoutV_Sparse = decltype(tile_to_shape(
+        SmemLayoutAtomQKV{},
+        make_shape(kBlockSparse, shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})/kBlockSparse, Int<kStages>{})));
+
+    using SmemLayoutIndex = Layout<Shape<Int<8192/kBlockSparse>>, Stride<Int<1>>>;
+
     using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
     using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, Element>;
 
@@ -116,10 +127,16 @@ struct CollectiveMainloopFwdSm80 {
     static_assert(NumMmaThreads % kGmemThreadsPerRow == 0, "NumMmaThreads must be a multiple of kGmemThreadsPerRow");
     using GmemLayoutAtom = Layout<Shape <Int<NumMmaThreads / kGmemThreadsPerRow>, Int<kGmemThreadsPerRow>>,
                                   Stride<Int<kGmemThreadsPerRow>, _1>>;
+    using GmemLayoutIndex = Layout<Shape<Int<NumMmaThreads>, Int<1>>, Stride<Int<1>, _1>>;
     using GmemTiledCopyQKV = decltype(
         make_tiled_copy(GmemCopyAtom{},
                         GmemLayoutAtom{},
-                        Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per read
+                        // Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per read
+                        Layout<Shape<_1, Int<kGmemElemsPerLoad>>, Stride<Int<kGmemElemsPerLoad>, _1>>{}));  // row 8 threads (8*16=64), col 4 threads and repeat 4 times to 16 (16)  # but it lead perf drop, very strange
+    using GmemTiledCopyIndex = decltype(
+        make_tiled_copy(GmemCopyAtom{},
+                        GmemLayoutIndex{},
+                        Layout<Shape<_1, Int<kGmemElemsPerLoad>>, Stride<Int<kGmemElemsPerLoad>, _1>>{}));  // row 8 threads (8*16=64), col 4 threads and repeat 4 times to 16 (16)  # but it lead perf drop, very strange
     // So that we don't have to check if we overshot kBlockM when we load Q
     static_assert(kBlockM % CUTE_STATIC_V(shape<0>(GmemLayoutAtom{})) == 0);
 
@@ -162,12 +179,16 @@ struct CollectiveMainloopFwdSm80 {
             cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
         };
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
+        // for prefetch index
+        cute::array_aligned<int, 8192/kBlockSparse> smem_block_sparse_index;
     };
 
     struct TensorStorageSeparateQV : cute::aligned_struct<128> {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>> smem_v;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
+        // for prefetch index
+        cute::array_aligned<int, 8192/kBlockSparse> smem_block_sparse_index;
     };
 
     using TensorStorage = std::conditional_t<Share_QV_Smem, TensorStorageSharedQV, TensorStorageSeparateQV>;
@@ -213,6 +234,8 @@ struct CollectiveMainloopFwdSm80 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        int const* const q2k_block_sparse_index = nullptr;
+        int const q2k_block_sparse_num = 0;
     };
 
     // Device side kernel params
@@ -259,6 +282,8 @@ struct CollectiveMainloopFwdSm80 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        int const* const q2k_block_sparse_index = nullptr;
+        int const q2k_block_sparse_num = 0;
     };
 
     static Params
@@ -301,7 +326,8 @@ struct CollectiveMainloopFwdSm80 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
+                args.q2k_block_sparse_index, args.q2k_block_sparse_num};
     }
 
     template <typename SharedStorage, typename FrgTensorO, typename Softmax>
@@ -328,10 +354,15 @@ struct CollectiveMainloopFwdSm80 {
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
             params.qhead_per_khead_divmod);
-        int const n_block_min = get<0>(n_block_min_max);
-        int const n_block_max = get<1>(n_block_min_max);
+        int n_block_min = get<0>(n_block_min_max);
+        int n_block_max = get<1>(n_block_min_max);
+        
+        if constexpr (Is_sparse) {
+            n_block_max = cute::ceil_div(params.q2k_block_sparse_num, kBlockN / kBlockSparse);
+            n_block_min = 0;
+        }
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
-        if constexpr (Is_causal || Is_local || Varlen || Split) {
+        if constexpr (Is_causal || Is_local || Varlen || Split || Is_sparse) {
             if (n_block_max <= n_block_min) { return false; }
         }
 
@@ -339,6 +370,9 @@ struct CollectiveMainloopFwdSm80 {
         Tensor sK = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK{});
         Tensor sV = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutV{});
         Tensor sVt = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVt{});
+
+        Tensor sK_sparse = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_k.data()), SmemLayoutK_Sparse{});
+        Tensor sV_sparse = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutV_Sparse{});
 
         bool const is_varlen_q = Varlen && params.cu_seqlens_q;
         bool const is_varlen_k = Varlen && params.cu_seqlens_k;
@@ -351,6 +385,11 @@ struct CollectiveMainloopFwdSm80 {
         Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V + seqlen_info.offset_k * get<0>(params.stride_V)), params.shape_K, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
         Tensor gV = local_tile(mV, select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
 
+        Tensor q2k_block_sparse_index = make_tensor(make_gmem_ptr(params.q2k_block_sparse_index + bidb * (params.q2k_block_sparse_num * params.q2k_block_sparse_num * 4) + bidh * (params.q2k_block_sparse_num * params.q2k_block_sparse_num) + m_block * params.q2k_block_sparse_num), make_shape(params.q2k_block_sparse_num));
+
+        Tensor gK_sparse = local_tile(mK, make_shape(Int<kBlockSparse>{}, Int<kHeadDim>{}), make_coord(_, _0{}));
+        Tensor gV_sparse = local_tile(mV, make_shape(Int<kBlockSparse>{}, Int<kHeadDim>{}), make_coord(_, _0{}));
+
         GmemTiledCopyQKV gmem_tiled_copy_QKV;
         auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(thread_idx);
         auto gmem_thr0_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(_0{});  // For index calculation
@@ -359,6 +398,9 @@ struct CollectiveMainloopFwdSm80 {
         Tensor tKsK = gmem_thr_copy_QKV.partition_D(sK);
         Tensor tVgV = gmem_thr_copy_QKV.partition_S(gV);  // (VCPY, VCPY_N, VCPY_K, nblocksN)
         Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
+
+        Tensor tKgK_sparse = gmem_thr_copy_QKV.partition_S(gK_sparse);
+        Tensor tVgV_sparse = gmem_thr_copy_QKV.partition_S(gV_sparse);
 
         TiledMma tiled_mma;
         auto thr_mma = tiled_mma.get_slice(thread_idx);
@@ -474,6 +516,85 @@ struct CollectiveMainloopFwdSm80 {
             }
         };
 
+
+        // params.q2k_block_sparse_index[(kBlockN / kBlockSparse) * n_block + i];
+        Tensor block_sparse_index = make_tensor<int>(make_shape(size<1>(tKsK)));
+        Tensor smem_block_sparse_index = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_block_sparse_index.data()), SmemLayoutIndex{});
+        
+        for (int i = threadIdx.x; i < params.q2k_block_sparse_num; i += blockDim.x) {
+            smem_block_sparse_index(i) = params.q2k_block_sparse_index[i];
+        }
+        __syncthreads();
+
+
+        auto load_K_sparse = [&] (decltype(block_sparse_index)& block_sparse_index, int const smem_pipe_write, auto need_seqlenk_masking_type) {
+            static constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
+            // static constexpr bool Seqlenk_mask = false;
+            #pragma unroll  
+            for (int n = 0; n < size<1>(tKsK); ++n) {
+                int n1 = n % size<1>(tKgK);
+                int n2 = n / size<1>(tKgK);
+                Tensor tKsK_cur = tKsK(_, n, _, smem_pipe_write);
+                if (block_sparse_index(n2) < params.q2k_block_sparse_num || !Seqlenk_mask) {
+                    Tensor tKgK_cur = tKgK_sparse(_, n1, _, block_sparse_index(n2));
+                    cute::copy(gmem_tiled_copy_QKV, tKgK_cur, tKsK_cur);
+                } else {
+                    clear(tKsK_cur);
+                }
+            }
+        };
+
+        auto load_V_sparse = [&] (decltype(block_sparse_index)& block_sparse_index, int const smem_pipe_write, auto need_seqlenk_masking_type) {
+            static constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
+            // static constexpr bool Seqlenk_mask = false;
+            #pragma unroll  
+            for (int n = 0; n < size<1>(tVsV); ++n) {
+                int n1 = n % size<1>(tVgV);
+                int n2 = n / size<1>(tVgV);
+                Tensor tVsV_cur = tVsV(_, n, _, smem_pipe_write);
+                if (block_sparse_index(n2) < params.q2k_block_sparse_num || !Seqlenk_mask) {
+                    Tensor tVgV_cur = tVgV_sparse(_, n1, _, block_sparse_index(n2));
+                    cute::copy(gmem_tiled_copy_QKV, tVgV_cur, tVsV_cur);
+                } else {
+                    clear(tVsV_cur);
+                }
+            }
+        };
+
+        // auto load_K_sparse = [&] (int const n_block, int const smem_pipe_write, auto need_seqlenk_masking_type) {
+        //     static constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
+        //     #pragma unroll  
+        //     for (int n = 0; n < size<1>(tKsK); ++n) {
+        //         int n1 = n % size<1>(tKgK);
+        //         int n2 = n / size<1>(tKgK);
+        //         Tensor tKsK_cur = tKsK(_, n, _, smem_pipe_write);
+        //         int const block_sparse_index = params.q2k_block_sparse_index[(kBlockN / kBlockSparse) * n_block + n2];
+        //         if (block_sparse_index < params.q2k_block_sparse_num || !Seqlenk_mask) {
+        //             Tensor tKgK_cur = tKgK_sparse(_, n1, _, block_sparse_index);
+        //             cute::copy(gmem_tiled_copy_QKV, tKgK_cur, tKsK_cur);
+        //         } else {
+        //             clear(tKsK_cur);
+        //         }
+        //     }
+        // };
+
+        // auto load_V_sparse = [&] (int const n_block, int const smem_pipe_write, auto need_seqlenk_masking_type) {
+        //     static constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
+        //     #pragma unroll  
+        //     for (int n = 0; n < size<1>(tVsV); ++n) {
+        //         int n1 = n % size<1>(tVgV);
+        //         int n2 = n / size<1>(tVgV);
+        //         Tensor tVsV_cur = tVsV(_, n, _, smem_pipe_write);
+        //         int const block_sparse_index = params.q2k_block_sparse_index[(kBlockN / kBlockSparse) * n_block + n2];
+        //         if (block_sparse_index < params.q2k_block_sparse_num || !Seqlenk_mask) {
+        //             Tensor tVgV_cur = tVgV_sparse(_, n1, _, block_sparse_index);
+        //             cute::copy(gmem_tiled_copy_QKV, tVgV_cur, tVsV_cur);
+        //         } else {
+        //             clear(tVsV_cur);
+        //         }
+        //     }
+        // };
+
         auto preprocess_Q = [&] {
             if constexpr (!AppendKV) {
                 flash::cp_async_wait<Share_QV_Smem ? 1 : kStages * 2 - 1>();
@@ -518,9 +639,20 @@ struct CollectiveMainloopFwdSm80 {
         // If Share_QV_Smem, we load Q, then load 1 stage of K, then (optionally) rotate Q and
         // read from smem_q to registers, then load V.
         // If !Share_QV, Smem, we load Q, load all stages of K & V, then (optionally) rotate Q.
+        #pragma unroll
+        for (int i = 0; i < size<1>(tKgK); ++i) {
+            // block_sparse_index(i) = params.q2k_block_sparse_index[(kBlockN / kBlockSparse) * n_block + i];
+            block_sparse_index(i) = smem_block_sparse_index[(kBlockN / kBlockSparse) * n_block + i];
+            // block_sparse_index(i) = (kBlockN / kBlockSparse) * n_block + i;
+        }
 
         if constexpr (Share_QV_Smem) {
-            load_K(n_block, 0, cute::true_type{} /*Seqlenk_mask*/);
+            if constexpr (Is_sparse) {
+                load_K_sparse(block_sparse_index, 0, cute::true_type{} /*Seqlenk_mask*/);
+                // load_K_sparse(n_block, 0, cute::true_type{} /*Seqlenk_mask*/);
+            } else {
+                load_K(n_block, 0, cute::true_type{} /*Seqlenk_mask*/);
+            }
             cute::cp_async_fence();
             preprocess_Q();
             __syncthreads();  // Make sure all threads have read smem_q before loading V
@@ -534,7 +666,12 @@ struct CollectiveMainloopFwdSm80 {
             static constexpr bool Is_last_stage = CUTE_STATIC_V(stage) == kStages - 1;
             if constexpr (!Share_QV_Smem || !Is_first_stage) {
                 if (Is_first_stage || n_block - stage >= n_block_min) {
-                    load_K(n_block - stage, stage, cute::bool_constant<Is_first_stage>{} /*Seqlenk_mask*/);
+                    if constexpr (Is_sparse) {
+                        load_K_sparse(block_sparse_index, stage, cute::bool_constant<Is_first_stage>{} /*Seqlenk_mask*/);
+                        // load_K_sparse(n_block - stage, stage, cute::bool_constant<Is_first_stage>{} /*Seqlenk_mask*/);
+                    } else {
+                        load_K(n_block - stage, stage, cute::bool_constant<Is_first_stage>{} /*Seqlenk_mask*/);
+                    }
                 }
                 // We want the fence outside the if statement to have a fixed number of cp.async commits.
                 // so that we can wait with the correct number of outstanding commits.
@@ -542,7 +679,12 @@ struct CollectiveMainloopFwdSm80 {
             }
             if constexpr (!Is_last_stage) {
                 if (Is_first_stage || n_block - stage >= n_block_min) {
-                    load_V(n_block - stage, stage, cute::bool_constant<Is_first_stage>{} /*Seqlenk_mask*/);
+                    if constexpr (Is_sparse) {
+                        load_V_sparse(block_sparse_index, stage, cute::bool_constant<Is_first_stage>{} /*Seqlenk_mask*/);
+                        // load_V_sparse(n_block - stage, stage, cute::bool_constant<Is_first_stage>{} /*Seqlenk_mask*/);
+                    } else {
+                        load_V(n_block - stage, stage, cute::bool_constant<Is_first_stage>{} /*Seqlenk_mask*/);
+                    }
                 }
                 cute::cp_async_fence();
             }
@@ -571,7 +713,18 @@ struct CollectiveMainloopFwdSm80 {
 
         auto load_K_next = [&] {
             if (n_block - kStages >= n_block_min) {
-                load_K(n_block - kStages, kStages > 1 ? smem_pipe_write : 0, cute::false_type{} /*Seqlenk_mask*/);
+                if constexpr (Is_sparse) {
+                    #pragma unroll
+                    for (int i = 0; i < size<1>(tKgK); ++i) {
+                        // block_sparse_index(i) = params.q2k_block_sparse_index[(kBlockN / kBlockSparse) * (n_block - kStages) + i];
+                        block_sparse_index(i) = smem_block_sparse_index[(kBlockN / kBlockSparse) * (n_block - kStages) + i];
+                        // block_sparse_index(i) = (kBlockN / kBlockSparse) * (n_block - kStages) + i;
+                    }
+                    load_K_sparse(block_sparse_index, kStages > 1 ? smem_pipe_write : 0, cute::false_type{} /*Seqlenk_mask*/);
+                    // load_K_sparse(n_block - kStages, kStages > 1 ? smem_pipe_write : 0, cute::false_type{} /*Seqlenk_mask*/);
+                } else {
+                    load_K(n_block - kStages, kStages > 1 ? smem_pipe_write : 0, cute::false_type{} /*Seqlenk_mask*/);
+                }
             }
             cute::cp_async_fence();
         };
@@ -591,7 +744,12 @@ struct CollectiveMainloopFwdSm80 {
             sync();
             auto load_V_next = [&] {
                 if (n_block - kStages + 1 >= n_block_min) {
-                    load_V(n_block - kStages + 1, kStages > 1 ? smem_pipe_write : 0, cute::bool_constant<Is_first_iter && kStages == 1>{} /*Seqlenk_mask*/);
+                    if constexpr (Is_sparse) {
+                        load_V_sparse(block_sparse_index, kStages > 1 ? smem_pipe_write : 0, cute::bool_constant<Is_first_iter && kStages == 1>{} /*Seqlenk_mask*/);
+                        // load_V_sparse(n_block - kStages + 1, kStages > 1 ? smem_pipe_write : 0, cute::bool_constant<Is_first_iter && kStages == 1>{} /*Seqlenk_mask*/);
+                    } else {
+                        load_V(n_block - kStages + 1, kStages > 1 ? smem_pipe_write : 0, cute::bool_constant<Is_first_iter && kStages == 1>{} /*Seqlenk_mask*/);
+                    }
                 }
                 cute::cp_async_fence();
             };

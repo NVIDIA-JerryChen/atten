@@ -85,6 +85,35 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     int seqlen_q = !is_varlen_q ? params.seqlen_q : params.total_q;
     int batch_q = !is_varlen_q ? params.b : 1;
     int batch_k = !is_varlen_k ? (params.kv_batch_idx ? params.b_k : params.b) : 1;
+    
+    // below code is to generate q2k enumlate sparse attention
+    // {
+        constexpr int blk = 16;// for forward, this is the number of kv blocks each q block attends to
+        int num_q_blocks = params.seqlen_q / blk;
+        int min_index = 0;
+        int max_index = params.seqlen_k / blk - 1; // for random test
+        // int K = 32; 
+        // int K = params.seqlen_k / blk - 1; // for full attention test
+        // assert seqlen_q should not exceed 8192, cause k only support 512 right now
+        int K = params.seqlen_q / blk; // for full attention test
+        int q2k_block_sparse_num = K;
+
+        int *h_q2k_block_sparse_index = new int[params.b * params.h * num_q_blocks * K];
+        for (int i = 0; i < params.b; i++) {
+            for (int j = 0; j < params.h; j++) {
+                for (int l = 0; l < num_q_blocks; l++) {
+                    for (int k = 0; k < K; k++) {
+                        h_q2k_block_sparse_index[i * params.h * num_q_blocks * K + j * num_q_blocks * K + l * K + k] = k; // for full attention test
+                    }
+                }
+            }
+        }
+        int *d_q2k_block_sparse_index = nullptr;
+        cudaMalloc(&d_q2k_block_sparse_index, params.b * params.h * num_q_blocks * K * sizeof(int));
+        cudaMemcpy(d_q2k_block_sparse_index, h_q2k_block_sparse_index, params.b * params.h * num_q_blocks * K * sizeof(int), cudaMemcpyHostToDevice);
+        free(h_q2k_block_sparse_index);
+    // }
+    
     typename CollectiveMainloop::StrideV v_strides =
         cute::conditional_return<!V_colmajor>(
             make_stride(params.v_row_stride, _1{}, params.v_head_stride, !is_varlen_k ? params.v_batch_stride : 0),
@@ -128,7 +157,9 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.kv_batch_idx,
         params.cu_seqlens_q, params.cu_seqlens_k, params.cu_seqlens_knew,
         params.seqused_q, params.seqused_k,
-        params.leftpad_k, params.seqlens_rotary
+        params.leftpad_k, params.seqlens_rotary,
+        d_q2k_block_sparse_index,
+        q2k_block_sparse_num
     };
     typename CollectiveEpilogue::Arguments epilogue_args {
         static_cast<ElementOut*>(params.o_ptr),

@@ -64,8 +64,13 @@ constexpr std::tuple<int, int, int, int, bool> tile_size_fwd_sm8x(
         } else if (headdim <= 96) {
             return {128, varlen_and_split || is_local ? 48 : 64, 4, 1, false};
         } else if (headdim <= 128) {
-            bool const use_8_warps = sm86_or_89 | varlen_and_split;
-            return {128, use_8_warps ? (varlen_and_split ? (is_local ? 96 : 112) : (is_local ? 96 : 128)) : (is_local ? 48 : 64), use_8_warps ? 8 : 4, 1, use_8_warps};
+            // FA2 tilesize
+            // bool const use_8_warps = sm86_or_89 | varlen_and_split;
+            // return {128, use_8_warps ? (varlen_and_split ? (is_local ? 96 : 112) : (is_local ? 96 : 128)) : (is_local ? 48 : 64), use_8_warps ? 8 : 4, 1, use_8_warps};
+
+            // 16x16 sparse
+            return {16, 48, 1, 1, true};
+            // return {16, 16, 1, 1, true};
         } else if (headdim <= 192) {
             bool const kBlockN_64 = append_kv || is_local || varlen_and_split || paged_kv;
             return {128, kBlockN_64 ? 64 : 96, 8, sm86_or_89 ? 1 : 2, !kBlockN_64};

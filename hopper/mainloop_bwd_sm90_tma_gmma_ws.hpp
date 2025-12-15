@@ -31,7 +31,7 @@ template <int Stages, int Stages_dO, int Stages_dS, class ClusterShape_, class T
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool Deterministic,
         bool SdP_swapAB_, bool dKV_swapAB_, bool dQ_swapAB_,
         int NumMmaWarpGroups=2, int AtomLayoutMSdP=1, int AtomLayoutNdKV=2, int AtomLayoutMdQ=1,
-        bool Mma_dP_is_RS=false>
+        bool Mma_dP_is_RS=false, bool Is_sparse=false>
 struct CollectiveMainloopBwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -72,7 +72,11 @@ struct CollectiveMainloopBwdSm90 {
     static_assert(NumMmaWarpGroups % AtomLayoutMSdP == 0);
     static_assert(NumMmaWarpGroups % AtomLayoutNdKV == 0);
     static_assert(NumMmaWarpGroups % AtomLayoutMdQ == 0);
+    static constexpr bool Mma_S_is_RS = Is_sparse && Mma_dP_is_RS;
+    static constexpr bool Kt_in_reg = false; // reg will spill
+
     static constexpr bool Mma_dKV_is_RS = AtomLayoutMSdP == 1 && AtomLayoutNdKV == NumMmaWarpGroups && SdP_swapAB && !dKV_swapAB;
+    // static constexpr bool Mma_dQ_is_RS = (AtomLayoutMSdP == NumMmaWarpGroups && AtomLayoutMdQ == NumMmaWarpGroups && !SdP_swapAB && !dQ_swapAB) || (Kt_in_reg && dQ_swapAB);  // If dQ_swapAB we can't use RS
     static constexpr bool Mma_dQ_is_RS = AtomLayoutMSdP == NumMmaWarpGroups && AtomLayoutMdQ == NumMmaWarpGroups && !SdP_swapAB && !dQ_swapAB;  // If dQ_swapAB we can't use RS
 
     static constexpr GMMA::Major PdS_Major = GMMA::Major::K;
@@ -91,6 +95,10 @@ struct CollectiveMainloopBwdSm90 {
     >;
     using TiledMmaSdP = decltype(cute::make_tiled_mma(
         cute::GMMA::ss_op_selector<Element, Element, ElementAccum, TileShapeAtomSdP>(),
+        AtomLayoutSdP{}));
+
+    using TiledMmaSRS = decltype(cute::make_tiled_mma(
+        cute::GMMA::rs_op_selector<Element, Element, ElementAccum, TileShapeAtomSdP>(),
         AtomLayoutSdP{}));
 
     using TiledMmadPRS = decltype(cute::make_tiled_mma(
@@ -125,6 +133,13 @@ struct CollectiveMainloopBwdSm90 {
         Layout<Shape<Int<AtomLayoutMdQ>, Int<NumMmaWarpGroups / AtomLayoutMdQ>, _1>>,
         Layout<Shape<Int<NumMmaWarpGroups / AtomLayoutMdQ>, Int<AtomLayoutMdQ>, _1>>
     >;
+    // using TiledMmadQ = decltype(cute::make_tiled_mma(
+    //     std::conditional_t<
+    //         Mma_dQ_is_RS,
+    //         decltype(cute::GMMA::rs_op_selector<Element, Element, ElementAccum, TileShapeAtomdQ, GMMA::Major::K, !dQ_swapAB ? GMMA::Major::MN : PdS_Major>()),
+    //         decltype(cute::GMMA::ss_op_selector<Element, Element, ElementAccum, TileShapeAtomdQ, !dQ_swapAB ? PdS_Major : GMMA::Major::MN, !dQ_swapAB ? GMMA::Major::MN : PdS_Major>())
+    //     >{},
+    //     AtomLayoutdQ{}));
     using TiledMmadQ = decltype(cute::make_tiled_mma(
         std::conditional_t<
             Mma_dQ_is_RS,
@@ -217,6 +232,12 @@ struct CollectiveMainloopBwdSm90 {
     using StrideLSE = cute::Stride<_1, int64_t, int64_t>;  // (seqlen, head, batch)
     using ShapedQaccum = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_q * d, head, batch)
     using StridedQaccum = cute::Stride<_1, int64_t, int64_t>;
+
+    using ShapeBlockSparse = cute::Shape<int32_t, int32_t, int32_t, int32_t>; // (block_size, head, block_num_k, block_num_q)
+    using StrideBlockSparse = cute::Stride<int64_t, int64_t, int64_t, _1>;
+    
+    using ShapeBlockSparseNum = cute::Shape<int32_t, int32_t, int32_t>;  // (block_size, head, block_num_q)
+    using StrideBlockSparseNum = cute::Stride<int64_t, int64_t, _1>;
 
     using TMA_QdO = decltype(make_tma_copy_A_sm90(
         GmemTiledCopyQdO{},
@@ -320,6 +341,14 @@ struct CollectiveMainloopBwdSm90 {
         int const* const cu_seqlens_k = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
+        int const* const k2q_block_sparse_index = nullptr;
+        ShapeBlockSparse const shape_block_sparse_index;
+        StrideBlockSparse const stride_block_sparse_index;
+        int const* const k2q_block_sparse_num = nullptr;
+        ShapeBlockSparseNum const shape_block_sparse_num;
+        StrideBlockSparseNum const stride_block_sparse_num;
+        int const* const block_size = nullptr; // used for backward mask
+        int const max_q_blocks_per_kv = 0;        // max block num in k2q_block_sparse_num
     };
 
     // Device side kernel params
@@ -350,6 +379,14 @@ struct CollectiveMainloopBwdSm90 {
         int const* const cu_seqlens_k = nullptr;
         int const* const seqused_q = nullptr;
         int const* const seqused_k = nullptr;
+        int const* const k2q_block_sparse_index = nullptr;
+        ShapeBlockSparse const shape_block_sparse_index;
+        StrideBlockSparse const stride_block_sparse_index;
+        int const* const k2q_block_sparse_num = nullptr;
+        ShapeBlockSparseNum const shape_block_sparse_num;
+        StrideBlockSparseNum const stride_block_sparse_num;
+        int const* const block_size = nullptr; // used for backward mask
+        int const max_q_blocks_per_kv = 0;        // max block num in k2q_block_sparse_num
     };
 
     static Params
@@ -406,7 +443,10 @@ struct CollectiveMainloopBwdSm90 {
                 args.window_size_left, args.window_size_right, attention_chunk_divmod,
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 args.num_batch, args.dq_semaphore,
-                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k};
+                args.cu_seqlens_q, args.cu_seqlens_k, args.seqused_q, args.seqused_k,
+                args.k2q_block_sparse_index, args.shape_block_sparse_index, args.stride_block_sparse_index,
+                args.k2q_block_sparse_num, args.shape_block_sparse_num, args.stride_block_sparse_num,
+                args.block_size, args.max_q_blocks_per_kv};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -740,8 +780,9 @@ struct CollectiveMainloopBwdSm90 {
                                                       make_stride(Int<cutlass::NumThreadsPerWarpGroup>{}));
 
         int warp_group_idx = __shfl_sync(0xFFFFFFFF, thread_idx / cutlass::NumThreadsPerWarpGroup, 0);
-        TiledMmaSdP tiled_mma_SdP;
+        using TiledMmaSdP = std::conditional_t<!Mma_S_is_RS, TiledMmaSdP, TiledMmaSRS>;
         using TiledMmadP = std::conditional_t<!Mma_dP_is_RS, TiledMmaSdP, TiledMmadPRS>;
+        TiledMmaSdP tiled_mma_SdP;
         TiledMmadP tiled_mma_dP;
         TiledMmadKV tiled_mma_dKV;
         TiledMmadQ tiled_mma_dQ;
@@ -831,6 +872,24 @@ struct CollectiveMainloopBwdSm90 {
             cute::copy(smem_tiled_copy_V, tdPsV_copy_view, tdPrV_copy_view);
         }
 
+        if constexpr (Mma_S_is_RS) {
+            using SmemCopyAtomK = Copy_Atom<cute::SM75_U32x4_LDSM_N, Element>;
+            auto smem_tiled_copy_K  = make_tiled_copy_A(SmemCopyAtomK{}, tiled_mma_SdP);
+            auto smem_thr_copy_K = smem_tiled_copy_K.get_thread_slice(thread_idx);
+            Tensor tSrK_copy_view = smem_thr_copy_K.retile_D(tSrK);
+            Tensor tSsK_copy_view = smem_thr_copy_K.partition_S(cute::as_position_independent_swizzle_tensor(sK));
+            cute::copy(smem_tiled_copy_K, tSsK_copy_view, tSrK_copy_view);
+        }
+
+        // if constexpr (Mma_dQ_is_RS) {
+        //     using SmemCopyAtomKt = Copy_Atom<cute::SM75_U16x8_LDSM_T, Element>;
+        //     auto smem_tiled_copy_Kt = make_tiled_copy_A(SmemCopyAtomKt{}, tiled_mma_dQ);
+        //     auto smem_thr_copy_Kt = smem_tiled_copy_Kt.get_thread_slice(thread_idx);
+        //     Tensor tdQrK_copy_view = smem_thr_copy_Kt.retile_D(tdQrK);
+        //     Tensor tdQsK_copy_view = smem_thr_copy_Kt.partition_S(cute::as_position_independent_swizzle_tensor(sKt));
+        //     cute::copy(smem_tiled_copy_Kt, tdQsK_copy_view, tdQrK_copy_view);
+        // }
+
         auto bwd_step = [&](int m_block, auto mask_fn) {
             Tensor tSrS = partition_fragment_C(tiled_mma_SdP, select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
             consumer_wait(pipeline_q, smem_pipe_read);
@@ -844,6 +903,13 @@ struct CollectiveMainloopBwdSm90 {
                     // It's ok to read OOB, since we made sure sLSE is large enough and we won't use the OOB values
                     tLSErLSE(i) = tLSEsLSE((thread_idx % 32) / 4 + i * 8, smem_pipe_read.index());
                 }
+            }
+            if (threadIdx.x % 256 == 0) {
+                printf("tLSErLSE :");
+                for (int i = 0; i < size(tLSErLSE); ++i) {
+                    printf("%f ", (float)tLSErLSE(i));
+                }
+                printf("\n");
             }
             Tensor tdPrdP = partition_fragment_C(tiled_mma_SdP, select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{}));
             PipelineState_dO smem_pipe_read_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_read, smem_pipe_read_do);

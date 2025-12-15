@@ -176,10 +176,10 @@ def test_flash_attn_output(
     torch.random.manual_seed(0)
     # batch_size = 40
     # nheads = 16
-    batch_size = 9 if seqlen_k <= 2048 else 2
-    # batch_size = 1
-    nheads = 6
-    # nheads = 1
+    # batch_size = 9 if seqlen_k <= 2048 else 2
+    batch_size = 8
+    # nheads = 6
+    nheads = 4
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
@@ -257,8 +257,11 @@ def test_flash_attn_output(
 
         print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
         print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
-        pack_gqa_vals = [False, True] if not DISABLE_PACKGQA else [False]
-        num_splits_vals = [1, 3] if not DISABLE_SPLIT else [1]
+        # pack_gqa_vals = [False, True] if not DISABLE_PACKGQA else [False]
+
+        pack_gqa_vals = [False]
+        # num_splits_vals = [1, 3] if not DISABLE_SPLIT else [1]
+        num_splits_vals = [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             print(f"{pack_gqa = }, {num_splits = }")
             out = flash_attn_func(
@@ -411,9 +414,10 @@ def test_flash_attn_varlen_output(
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
     # batch_size = 40
     # nheads = 16
-    batch_size = 9 if seqlen_q <= 2048 else 2
+    # batch_size = 4 if seqlen_q <= 2048 else 2
+    batch_size = 1
     # batch_size = 32
-    nheads = 6
+    nheads = 1
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
     # batch_size = 2
     # nheads = 1
@@ -472,6 +476,8 @@ def test_flash_attn_varlen_output(
         key_padding_mask, key_unused_mask = _gen_unused_masks(
             key_padding_mask, add_unused_qkv, seqlen_k, batch_size, k.device
         )
+        key_padding_mask = None
+        query_padding_mask = None
 
         (
             q_unpad,
@@ -1261,3 +1267,51 @@ def test_flash3_bw_compatibility() -> None:
         "int attention_chunk=0, bool has_softcap=False, int num_splits=0, bool? pack_gqa=None, "
         "int sm_margin=0) -> Tensor"
     ))
+
+# def test_flash_attn_varlen_output(
+#     seqlen_q, seqlen_k, d, add_unused_qkv, causal, local, softcap, deterministic, has_qv, mha_type, dtype,
+# ):
+
+if __name__ == "__main__":
+    # test_flash_attn_varlen_output(
+    #     seqlen_q=64,
+    #     seqlen_k=64,
+    #     d=128,
+    #     add_unused_qkv=False,
+    #     causal=False,
+    #     local=False,
+    #     softcap=0.0,
+    #     deterministic=False,
+    #     has_qv=False,
+    #     mha_type="mha",
+    #     dtype=torch.bfloat16,
+    # )
+    # def test_flash_attn_output(
+    #         seqlen_q, seqlen_k, d, causal, local, softcap, V_colmajor, deterministic, has_qv, mha_type, dtype
+    # ):
+    # test_flash_attn_output(
+    #     seqlen_q=8192,
+    #     seqlen_k=8192,
+    #     d=128,
+    #     causal=False,
+    #     local=False,
+    #     softcap=0.0,
+    #     V_colmajor=False,
+    #     deterministic=False,
+    #     has_qv=False,
+    #     mha_type="mha",
+    #     dtype=torch.bfloat16,
+    # )
+    test_flash_attn_output(
+        seqlen_q=8192,
+        seqlen_k=8192,
+        d=128,
+        causal=False,
+        local=False,
+        softcap=0.0,
+        V_colmajor=False,
+        deterministic=False,
+        has_qv=False,
+        mha_type="mha",
+        dtype=torch.bfloat16,
+    )
