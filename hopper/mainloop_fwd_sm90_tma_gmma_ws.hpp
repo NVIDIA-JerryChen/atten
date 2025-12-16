@@ -245,6 +245,9 @@ struct CollectiveMainloopFwdSm90 {
     using StrideRotary = cute::Stride<int64_t, _1>;
     using StrideDescale = cute::Stride<int64_t, int64_t>;
 
+    using ShapeBlockSparseIndices = cute::Shape<int64_t, int64_t, int64_t, int64_t>;
+    using StrideBlockSparseIndices = cute::Stride<int64_t, int64_t, int64_t, _1>;
+
     using TMA_Q = decltype(make_tma_copy_A_sm90(
         GmemTiledCopyQ{},
         make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeQKV{}, StrideQK{}),
@@ -397,6 +400,9 @@ struct CollectiveMainloopFwdSm90 {
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
         int const* const q2k_block_sparse_index = nullptr;
+        ShapeBlockSparseIndices const shape_block_sparse_indices;
+        StrideBlockSparseIndices const stride_block_sparse_indices;
+        int const q2k_block_topk = 0;
         int const q2k_block_sparse_num = 0;
     };
 
@@ -456,6 +462,9 @@ struct CollectiveMainloopFwdSm90 {
         int const* const leftpad_k = nullptr;
         int const *const seqlens_rotary = nullptr;
         int const* const q2k_block_sparse_index = nullptr;
+        ShapeBlockSparseIndices const shape_block_sparse_indices;
+        StrideBlockSparseIndices const stride_block_sparse_indices;
+        int const q2k_block_topk = 0;
         int const q2k_block_sparse_num = 0;
     };
 
@@ -569,7 +578,9 @@ struct CollectiveMainloopFwdSm90 {
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
                 args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
-                args.q2k_block_sparse_index, args.q2k_block_sparse_num};
+                args.q2k_block_sparse_index, args.shape_block_sparse_indices, args.stride_block_sparse_indices, 
+                args.q2k_block_topk,
+                args.q2k_block_sparse_num};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance

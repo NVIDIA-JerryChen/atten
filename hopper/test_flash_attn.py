@@ -196,7 +196,7 @@ def test_flash_attn_output(
     ratio = 0.9
     num_k_blocks = (seqlen_k - 1) // 16 + 1
     top_k_blocks = (int(seqlen_k * ratio) - 1) // 16 + 1
-    indices_shape = (batch_size, nheads, (seqlen_q - 1) // 16 + 1)
+    indices_shape = (batch_size, nheads_kv, (seqlen_q - 1) // 16 + 1)
     num = functools.reduce(lambda x, y: x * y, indices_shape)
 
     block_sparse_indices = np.arange(num_k_blocks, dtype=np.int32)

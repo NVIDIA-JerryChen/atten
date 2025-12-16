@@ -932,12 +932,23 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     params.num_pages = num_pages;
 
     if (block_sparse_indices_.has_value()) {
+        TORCH_CHECK(seqlen_q % 16 == 0, "seqlen_q should be a multiple of 16");
+        TORCH_CHECK(seqlen_k % 16 == 0, "seqlen_k should be a multiple of 16");
+
         auto block_sparse_indices = block_sparse_indices_.value();
         auto block_sparse_topk = block_sparse_indices.size(3);
-        CHECK_SHAPE(block_sparse_indices, batch_size, num_heads, (seqlen_q - 1) / block_sparse_blocksize_m + 1, block_sparse_topk);
+        CHECK_SHAPE(block_sparse_indices, batch_size, num_heads_k, (seqlen_q - 1) / block_sparse_blocksize_m + 1, block_sparse_topk);
 
         params.block_sparse_indices = block_sparse_indices.data_ptr<int>();
         params.block_sparse_topk = block_sparse_topk;
+
+        params.block_sparse_indices_batch_stride = block_sparse_indices.stride(0);
+        params.block_sparse_indices_head_stride = block_sparse_indices.stride(1);
+        params.block_sparse_indices_row_stride = block_sparse_indices.stride(2);
+
+        params.is_sparse = true;
+    } else {
+        params.is_sparse = false;
     }
 
     if (k_new_.has_value()) {  // This needs to be set before get_pagedkv_tma

@@ -110,7 +110,7 @@ struct CollectiveMainloopFwdSm80 {
         SmemLayoutAtomQKV{},
         make_shape(kBlockSparse, shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})/kBlockSparse, Int<kStages>{})));
 
-    using SmemLayoutIndex = Layout<Shape<Int<8192/kBlockSparse>>, Stride<Int<1>>>;
+    using SmemLayoutIndex = Layout<Shape<Int<(8192+128)/kBlockSparse>>, Stride<Int<1>>>;
 
     using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
     using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, Element>;
@@ -170,6 +170,9 @@ struct CollectiveMainloopFwdSm80 {
     using ShapeRotary = cute::Shape<int32_t, int32_t>;  // (seqlen_ro, rotary_dim // 2)
     using StrideRotary = cute::Stride<int64_t, _1>;
     using StrideDescale = cute::Stride<int64_t, int64_t>;
+    
+    using ShapeBlockSparseIndices = cute::Shape<int64_t, int64_t, int64_t, int64_t>;
+    using StrideBlockSparseIndices = cute::Stride<int64_t, int64_t, int64_t, _1>;
 
     static constexpr bool Share_QV_Smem = Q_in_regs;
 
@@ -235,6 +238,9 @@ struct CollectiveMainloopFwdSm80 {
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
         int const* const q2k_block_sparse_index = nullptr;
+        ShapeBlockSparseIndices const shape_block_sparse_indices;
+        StrideBlockSparseIndices const stride_block_sparse_indices;
+        int const q2k_block_topk = 0;
         int const q2k_block_sparse_num = 0;
     };
 
@@ -283,6 +289,9 @@ struct CollectiveMainloopFwdSm80 {
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
         int const* const q2k_block_sparse_index = nullptr;
+        ShapeBlockSparseIndices const shape_block_sparse_indices;
+        StrideBlockSparseIndices const stride_block_sparse_indices;
+        int const q2k_block_topk = 0;
         int const q2k_block_sparse_num = 0;
     };
 
@@ -327,7 +336,11 @@ struct CollectiveMainloopFwdSm80 {
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
                 args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
-                args.q2k_block_sparse_index, args.q2k_block_sparse_num};
+                args.q2k_block_sparse_index, 
+                args.shape_block_sparse_indices, 
+                args.stride_block_sparse_indices, 
+                args.q2k_block_topk,
+                args.q2k_block_sparse_num};
     }
 
     template <typename SharedStorage, typename FrgTensorO, typename Softmax>
@@ -358,7 +371,7 @@ struct CollectiveMainloopFwdSm80 {
         int n_block_max = get<1>(n_block_min_max);
         
         if constexpr (Is_sparse) {
-            n_block_max = cute::ceil_div(params.q2k_block_sparse_num, kBlockN / kBlockSparse);
+            n_block_max = cute::ceil_div(params.q2k_block_topk, kBlockN / kBlockSparse);
             n_block_min = 0;
         }
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
@@ -384,8 +397,6 @@ struct CollectiveMainloopFwdSm80 {
         Tensor gK = local_tile(mK, select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
         Tensor mV = make_tensor(make_gmem_ptr(params.ptr_V + seqlen_info.offset_k * get<0>(params.stride_V)), params.shape_K, params.stride_V)(_, _, bidh_kv, !is_varlen_k ? bidb_kv : 0);
         Tensor gV = local_tile(mV, select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}));  // (N, K, _)
-
-        Tensor q2k_block_sparse_index = make_tensor(make_gmem_ptr(params.q2k_block_sparse_index + bidb * (params.q2k_block_sparse_num * params.q2k_block_sparse_num * 4) + bidh * (params.q2k_block_sparse_num * params.q2k_block_sparse_num) + m_block * params.q2k_block_sparse_num), make_shape(params.q2k_block_sparse_num));
 
         Tensor gK_sparse = local_tile(mK, make_shape(Int<kBlockSparse>{}, Int<kHeadDim>{}), make_coord(_, _0{}));
         Tensor gV_sparse = local_tile(mV, make_shape(Int<kBlockSparse>{}, Int<kHeadDim>{}), make_coord(_, _0{}));
@@ -516,13 +527,15 @@ struct CollectiveMainloopFwdSm80 {
             }
         };
 
-
-        // params.q2k_block_sparse_index[(kBlockN / kBlockSparse) * n_block + i];
-        Tensor block_sparse_index = make_tensor<int>(make_shape(size<1>(tKsK)));
+        Tensor block_sparse_index = make_tensor<int>(make_shape(Int<kBlockN / kBlockSparse>{}));
+        Tensor gmem_block_sparse_index = make_tensor(make_gmem_ptr(params.q2k_block_sparse_index), params.shape_block_sparse_indices, params.stride_block_sparse_indices)(bidb, bidh_kv, m_block, _);
         Tensor smem_block_sparse_index = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_block_sparse_index.data()), SmemLayoutIndex{});
-        
-        for (int i = threadIdx.x; i < params.q2k_block_sparse_num; i += blockDim.x) {
-            smem_block_sparse_index(i) = params.q2k_block_sparse_index[i];
+
+        for (int i = threadIdx.x; i < params.q2k_block_topk; i += blockDim.x) {
+            smem_block_sparse_index(i) = gmem_block_sparse_index(i);
+        }
+        for (int i = params.q2k_block_topk + threadIdx.x; i < size(smem_block_sparse_index); i += blockDim.x) {
+            smem_block_sparse_index(i) = INT_MAX;
         }
         __syncthreads();
 
@@ -532,15 +545,16 @@ struct CollectiveMainloopFwdSm80 {
             // static constexpr bool Seqlenk_mask = false;
             #pragma unroll  
             for (int n = 0; n < size<1>(tKsK); ++n) {
-                int n1 = n % size<1>(tKgK);
-                int n2 = n / size<1>(tKgK);
+                int n1 = n % size<1>(tKgK_sparse);
+                int n2 = n / size<1>(tKgK_sparse);
                 Tensor tKsK_cur = tKsK(_, n, _, smem_pipe_write);
                 if (block_sparse_index(n2) < params.q2k_block_sparse_num || !Seqlenk_mask) {
                     Tensor tKgK_cur = tKgK_sparse(_, n1, _, block_sparse_index(n2));
                     cute::copy(gmem_tiled_copy_QKV, tKgK_cur, tKsK_cur);
-                } else {
-                    clear(tKsK_cur);
-                }
+                } 
+                // else {
+                //     // clear(tKsK_cur); // do not need clear K, casuse it will be done in sparse mask func
+                // }
             }
         };
 
@@ -549,8 +563,8 @@ struct CollectiveMainloopFwdSm80 {
             // static constexpr bool Seqlenk_mask = false;
             #pragma unroll  
             for (int n = 0; n < size<1>(tVsV); ++n) {
-                int n1 = n % size<1>(tVgV);
-                int n2 = n / size<1>(tVgV);
+                int n1 = n % size<1>(tVgV_sparse);
+                int n2 = n / size<1>(tVgV_sparse);
                 Tensor tVsV_cur = tVsV(_, n, _, smem_pipe_write);
                 if (block_sparse_index(n2) < params.q2k_block_sparse_num || !Seqlenk_mask) {
                     Tensor tVgV_cur = tVgV_sparse(_, n1, _, block_sparse_index(n2));
@@ -560,40 +574,6 @@ struct CollectiveMainloopFwdSm80 {
                 }
             }
         };
-
-        // auto load_K_sparse = [&] (int const n_block, int const smem_pipe_write, auto need_seqlenk_masking_type) {
-        //     static constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
-        //     #pragma unroll  
-        //     for (int n = 0; n < size<1>(tKsK); ++n) {
-        //         int n1 = n % size<1>(tKgK);
-        //         int n2 = n / size<1>(tKgK);
-        //         Tensor tKsK_cur = tKsK(_, n, _, smem_pipe_write);
-        //         int const block_sparse_index = params.q2k_block_sparse_index[(kBlockN / kBlockSparse) * n_block + n2];
-        //         if (block_sparse_index < params.q2k_block_sparse_num || !Seqlenk_mask) {
-        //             Tensor tKgK_cur = tKgK_sparse(_, n1, _, block_sparse_index);
-        //             cute::copy(gmem_tiled_copy_QKV, tKgK_cur, tKsK_cur);
-        //         } else {
-        //             clear(tKsK_cur);
-        //         }
-        //     }
-        // };
-
-        // auto load_V_sparse = [&] (int const n_block, int const smem_pipe_write, auto need_seqlenk_masking_type) {
-        //     static constexpr bool Seqlenk_mask = decltype(need_seqlenk_masking_type)::value;
-        //     #pragma unroll  
-        //     for (int n = 0; n < size<1>(tVsV); ++n) {
-        //         int n1 = n % size<1>(tVgV);
-        //         int n2 = n / size<1>(tVgV);
-        //         Tensor tVsV_cur = tVsV(_, n, _, smem_pipe_write);
-        //         int const block_sparse_index = params.q2k_block_sparse_index[(kBlockN / kBlockSparse) * n_block + n2];
-        //         if (block_sparse_index < params.q2k_block_sparse_num || !Seqlenk_mask) {
-        //             Tensor tVgV_cur = tVgV_sparse(_, n1, _, block_sparse_index);
-        //             cute::copy(gmem_tiled_copy_QKV, tVgV_cur, tVsV_cur);
-        //         } else {
-        //             clear(tVsV_cur);
-        //         }
-        //     }
-        // };
 
         auto preprocess_Q = [&] {
             if constexpr (!AppendKV) {
@@ -640,7 +620,7 @@ struct CollectiveMainloopFwdSm80 {
         // read from smem_q to registers, then load V.
         // If !Share_QV, Smem, we load Q, load all stages of K & V, then (optionally) rotate Q.
         #pragma unroll
-        for (int i = 0; i < size<1>(tKgK); ++i) {
+        for (int i = 0; i < kBlockN / kBlockSparse; ++i) {
             // block_sparse_index(i) = params.q2k_block_sparse_index[(kBlockN / kBlockSparse) * n_block + i];
             block_sparse_index(i) = smem_block_sparse_index[(kBlockN / kBlockSparse) * n_block + i];
             // block_sparse_index(i) = (kBlockN / kBlockSparse) * n_block + i;
@@ -715,7 +695,7 @@ struct CollectiveMainloopFwdSm80 {
             if (n_block - kStages >= n_block_min) {
                 if constexpr (Is_sparse) {
                     #pragma unroll
-                    for (int i = 0; i < size<1>(tKgK); ++i) {
+                    for (int i = 0; i < kBlockN / kBlockSparse; ++i) {
                         // block_sparse_index(i) = params.q2k_block_sparse_index[(kBlockN / kBlockSparse) * (n_block - kStages) + i];
                         block_sparse_index(i) = smem_block_sparse_index[(kBlockN / kBlockSparse) * (n_block - kStages) + i];
                         // block_sparse_index(i) = (kBlockN / kBlockSparse) * (n_block - kStages) + i;
@@ -761,9 +741,22 @@ struct CollectiveMainloopFwdSm80 {
             );
             smem_pipe_write = smem_pipe_write < kStages - 1 ? smem_pipe_write + 1 : 0;
             scoremod_premask_fn(tSrS);
+            if constexpr (Is_sparse && Is_first_iter) {
+                Tensor tSrS_view = make_tensor(tSrS.data(), group<1, 3>(group<0, 2>(select<1, 2, 0, 3>(flatten(tSrS.layout())))));
+                #pragma unroll
+                for (int mma_col = 0; mma_col < size<1>(tSrS_view); mma_col++) {
+                    int matrix_id = mma_col / 4; // (2, 2) in col
+                    if (block_sparse_index(matrix_id) >= params.q2k_block_sparse_num) {
+                        #pragma unroll
+                        for (int mma_row = 0; mma_row < size<0>(tSrS_view); mma_row++) {
+                            tSrS_view(mma_row, mma_col) = -INFINITY;
+                        }
+                    }
+                }
+            }
             // Faster to load_K before gemm if we only have 1 stage
             if constexpr (kStages == 1) { sync(); load_K_next(); }
-            mask_fn(tSrS, n_block);
+            if constexpr (!Is_sparse) { mask_fn(tSrS, n_block);}
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
             softmax.template online_softmax</*Is_first=*/Is_first_iter, Check_inf>(tSrS);
             if constexpr (Is_FP8) { flash::permute_Cregs_fp8(tSrS); }
@@ -778,7 +771,7 @@ struct CollectiveMainloopFwdSm80 {
             smem_pipe_read = smem_pipe_read < kStages - 1 ? smem_pipe_read + 1 : 0;
         };
 
-        auto first_iter_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
+        auto first_iter_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local, Is_sparse>(tSrS, m_block, n_block); };
         fwd_step(n_block, first_iter_mask_fn, cute::true_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
         --n_block;
         if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking

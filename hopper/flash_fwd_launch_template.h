@@ -131,7 +131,10 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         params.seqused_q, params.seqused_k,
         params.leftpad_k, params.seqlens_rotary,
         params.block_sparse_indices,
-        params.block_sparse_topk
+        {params.b, params.h_k, params.seqlen_q / 16, params.block_sparse_topk},
+        {params.block_sparse_indices_batch_stride, params.block_sparse_indices_head_stride, params.block_sparse_indices_row_stride, _1{}},
+        params.block_sparse_topk,
+        params.seqlen_k / 16
     };
     typename CollectiveEpilogue::Arguments epilogue_args {
         static_cast<ElementOut*>(params.o_ptr),
