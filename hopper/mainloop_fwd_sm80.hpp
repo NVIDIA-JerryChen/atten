@@ -110,7 +110,7 @@ struct CollectiveMainloopFwdSm80 {
         SmemLayoutAtomQKV{},
         make_shape(kBlockSparse, shape<2>(TileShape_MNK{}), shape<1>(TileShape_MNK{})/kBlockSparse, Int<kStages>{})));
 
-    using SmemLayoutIndex = Layout<Shape<Int<(8192+128)/kBlockSparse>>, Stride<Int<1>>>;
+    using SmemLayoutIndex = Layout<Shape<Int<2*(8192+4096)/kBlockSparse>>, Stride<Int<1>>>;
 
     using SmemCopyAtom = Copy_Atom<SM75_U32x4_LDSM_N, Element>;
     using SmemCopyAtomTransposed = Copy_Atom<SM75_U16x8_LDSM_T, Element>;
@@ -183,15 +183,15 @@ struct CollectiveMainloopFwdSm80 {
         };
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
         // for prefetch index
-        cute::array_aligned<int, 8192/kBlockSparse> smem_block_sparse_index;
+        cute::array_aligned<uint16_t,  cute::cosize_v<SmemLayoutIndex>> smem_block_sparse_index;
     };
 
     struct TensorStorageSeparateQV : cute::aligned_struct<128> {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>> smem_v;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>> smem_k;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>> smem_q;
-        // for prefetch index
-        cute::array_aligned<int, 8192/kBlockSparse> smem_block_sparse_index;
+        // for prefetch index, unsupport
+        cute::array_aligned<uint16_t,  cute::cosize_v<SmemLayoutIndex>> smem_block_sparse_index;
     };
 
     using TensorStorage = std::conditional_t<Share_QV_Smem, TensorStorageSharedQV, TensorStorageSeparateQV>;
@@ -531,11 +531,14 @@ struct CollectiveMainloopFwdSm80 {
         Tensor gmem_block_sparse_index = make_tensor(make_gmem_ptr(params.q2k_block_sparse_index), params.shape_block_sparse_indices, params.stride_block_sparse_indices)(bidb, bidh_kv, m_block, _);
         Tensor smem_block_sparse_index = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_block_sparse_index.data()), SmemLayoutIndex{});
 
-        for (int i = threadIdx.x; i < params.q2k_block_topk; i += blockDim.x) {
+
+        // first pretetch the block sparse index to smem
+        int const min_segment_size = min(size(smem_block_sparse_index), params.q2k_block_topk);
+        for (int i = threadIdx.x; i < min_segment_size; i += blockDim.x) {
             smem_block_sparse_index(i) = gmem_block_sparse_index(i);
         }
-        for (int i = params.q2k_block_topk + threadIdx.x; i < size(smem_block_sparse_index); i += blockDim.x) {
-            smem_block_sparse_index(i) = INT_MAX;
+        for (int i = min_segment_size + threadIdx.x; i < min_segment_size + blockDim.x; i += blockDim.x) {
+            smem_block_sparse_index(i) = UINT16_MAX;
         }
         __syncthreads();
 
@@ -621,8 +624,8 @@ struct CollectiveMainloopFwdSm80 {
         // If !Share_QV, Smem, we load Q, load all stages of K & V, then (optionally) rotate Q.
         #pragma unroll
         for (int i = 0; i < kBlockN / kBlockSparse; ++i) {
-            // block_sparse_index(i) = params.q2k_block_sparse_index[(kBlockN / kBlockSparse) * n_block + i];
             block_sparse_index(i) = smem_block_sparse_index[(kBlockN / kBlockSparse) * n_block + i];
+            // block_sparse_index(i) = gmem_block_sparse_index[(kBlockN / kBlockSparse) * n_block + i];
             // block_sparse_index(i) = (kBlockN / kBlockSparse) * n_block + i;
         }
 
@@ -696,8 +699,8 @@ struct CollectiveMainloopFwdSm80 {
                 if constexpr (Is_sparse) {
                     #pragma unroll
                     for (int i = 0; i < kBlockN / kBlockSparse; ++i) {
-                        // block_sparse_index(i) = params.q2k_block_sparse_index[(kBlockN / kBlockSparse) * (n_block - kStages) + i];
                         block_sparse_index(i) = smem_block_sparse_index[(kBlockN / kBlockSparse) * (n_block - kStages) + i];
+                        // block_sparse_index(i) = gmem_block_sparse_index[(kBlockN / kBlockSparse) * (n_block - kStages) + i];
                         // block_sparse_index(i) = (kBlockN / kBlockSparse) * (n_block - kStages) + i;
                     }
                     load_K_sparse(block_sparse_index, kStages > 1 ? smem_pipe_write : 0, cute::false_type{} /*Seqlenk_mask*/);
