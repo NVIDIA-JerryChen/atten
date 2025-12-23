@@ -477,8 +477,30 @@ def _flash_attn_fwd(
                 f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x"
             )
         # TODO: check @can_implement
-        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
-            fa_fwd,
+
+        with torch.cuda.nvtx.range("flash_attn_fwd_kernel"):
+            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+                fa_fwd,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                o_tensor,
+                lse_tensor,
+                softmax_scale,
+                current_stream,
+                cu_seqlens_q_tensor,
+                cu_seqlens_k_tensor,
+                seqused_q_tensor,
+                seqused_k_tensor,
+                page_table_tensor,
+                window_size_left,
+                window_size_right,
+                learnable_sink_tensor,
+                sparse_tensors,
+                cute_aux_tensors,
+            )
+    with torch.cuda.nvtx.range("flash_attn_fwd_kernel"):
+        _flash_attn_fwd.compile_cache[compile_key](
             q_tensor,
             k_tensor,
             v_tensor,
@@ -497,25 +519,6 @@ def _flash_attn_fwd(
             sparse_tensors,
             cute_aux_tensors,
         )
-    _flash_attn_fwd.compile_cache[compile_key](
-        q_tensor,
-        k_tensor,
-        v_tensor,
-        o_tensor,
-        lse_tensor,
-        softmax_scale,
-        current_stream,
-        cu_seqlens_q_tensor,
-        cu_seqlens_k_tensor,
-        seqused_q_tensor,
-        seqused_k_tensor,
-        page_table_tensor,
-        window_size_left,
-        window_size_right,
-        learnable_sink_tensor,
-        sparse_tensors,
-        cute_aux_tensors,
-    )
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,
