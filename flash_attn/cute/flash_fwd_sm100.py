@@ -1976,7 +1976,7 @@ class FlashAttentionForwardSm100:
                                     + self.tmem_s_offset[0],
                                     tStS.layout,
                                 ),
-                                mask_fn=partial(mask_fn, mask_seqlen=False),
+                                mask_fn=partial(mask_fn, mask_seqlen=True),
                             )
                         else:
                             mma_si_consumer_phase[1], si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(
@@ -1991,7 +1991,7 @@ class FlashAttentionForwardSm100:
                                     + self.tmem_s_offset[1],
                                     tStS.layout,
                                 ),
-                                mask_fn=partial(mask_fn, mask_seqlen=False),
+                                mask_fn=partial(mask_fn, mask_seqlen=True),
                             )
                     n_block -= 1
                     softmax_count ^= 1
@@ -2525,7 +2525,9 @@ class FlashAttentionForwardSm100:
                         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_corr_epi_full_offset + stage)
                     # Signal for the next work tile that O buffers in tmem are already read, so
                     # mma warp can write to them
-                    cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
+                    # cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
+                    cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + (stage if self.q_stage == 2 else correction_count))
+                    # correction_count ^= 1
                     # if tidx == 0: cute.printf("Correction final scale for stage %d: %f\n", stage, scale)
 
                 o_corr_consumer_phase ^= 1
