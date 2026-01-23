@@ -1942,6 +1942,8 @@ class FlashAttentionForwardSm100:
                     self.mbar_P_full_2_offset,
                     self.q_stage,
                     Int32(stage),
+                    tStS,
+                    self.tmem_s_offset,
                 )
                 if not empty_tile:
                     sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]

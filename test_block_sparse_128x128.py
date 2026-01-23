@@ -355,15 +355,20 @@ def convert_block_mask_to_fa4_format(
 
 def convert_binary_mask_to_fa4_format(
     block_mask_binary: torch.Tensor,
-    q_stage: int = 2,
+    q_stage: int = 1,
 ) -> BlockSparseTensorsTorch:
     """
     直接从 binary block mask 创建 FA4 BlockSparseTensorsTorch 格式
     不需要通过 FlexAttention，避免大 seq_len 时的 OOM
     
+    对于 non-causal 128x128 block sparse (q_stage=1):
+    - 所有选中的 block 都是 FULL block（不需要 element-level mask）
+    - full_block_cnt/idx 包含选中的 block
+    - mask_block_cnt/idx 应为空
+    
     Args:
         block_mask_binary: (B, H, num_q_blocks, num_k_blocks) 的 0-1 mask
-        q_stage: FA4 的 q_stage 参数，SM100 上通常为 2，意味着每 q_stage 个 q blocks 合并为一个
+        q_stage: FA4 的 q_stage 参数，SM100 上 q_stage=1 表示128x128 粒度，目前已支持 128x128 粒度
     
     Returns:
         BlockSparseTensorsTorch: FA4 所需的 block sparse tensors
@@ -390,16 +395,11 @@ def convert_binary_mask_to_fa4_format(
     B, H, num_q_blocks_effective, num_k_blocks = block_mask_binary.shape
     
     # 计算每个 query block 对应的有效 key block 数量
+    # 对于 non-causal，所有选中的 block 都是 FULL block
     # shape: (B, H, num_q_blocks_effective)
-    mask_block_cnt = block_mask_binary.sum(dim=-1).to(torch.int32)
+    full_block_cnt = block_mask_binary.sum(dim=-1).to(torch.int32)
     
-    # 创建 mask_block_idx: (B, H, num_q_blocks_effective, num_k_blocks)
-    # 注意：FA4 期望最后一维是总 k blocks 数，不是最大有效数
-    mask_block_idx = torch.zeros(
-        B, H, num_q_blocks_effective, num_k_blocks, 
-        dtype=torch.int32, device=device
-    )
-    
+    # 创建 full_block_idx: (B, H, num_q_blocks_effective, num_k_blocks)
     # 使用向量化操作获取每个 query block 的有效 key block 索引
     # 将有效的 k block 索引排在前面，无效的位置填 0
     positions = torch.arange(num_k_blocks, device=device).view(1, 1, 1, -1).expand(B, H, num_q_blocks_effective, -1)
@@ -414,13 +414,12 @@ def convert_binary_mask_to_fa4_format(
         torch.zeros_like(sorted_indices),
         sorted_indices
     )
-    mask_block_idx = sorted_indices.to(torch.int32)
+    full_block_idx = sorted_indices.to(torch.int32)
     
-    # FA4 需要同时提供 full_block_cnt 和 full_block_idx(即使全是 0)
-    # 当某个 Q block 的 mask_block_cnt == 0 时，FA4 会去处理 full_block_idx
-    # 所以必须提供，否则会报 NoneType 错误
-    full_block_cnt = torch.zeros_like(mask_block_cnt)
-    full_block_idx = torch.zeros_like(mask_block_idx)
+    # 对于 non-causal 128x128 block sparse，mask_block 应为空
+    # （除了对于超出 seqlen 的 block，其余block 内部不需要 element-level masking）
+    mask_block_cnt = torch.zeros_like(full_block_cnt)
+    mask_block_idx = torch.zeros_like(full_block_idx)
     
     return BlockSparseTensorsTorch(
         mask_block_cnt=mask_block_cnt,
