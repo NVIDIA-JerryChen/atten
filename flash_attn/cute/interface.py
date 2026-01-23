@@ -276,7 +276,7 @@ def _flash_attn_fwd(
         if compute_capability == 10:
             # TODO: This multiplier should really be q_stage, wire up in later PR
             # 1 cta handles 2*tile_m row
-            m_block_size_block = 2 * m_block_size
+            m_block_size_block = 1 * m_block_size
         expected_m_blocks = (seqlen_q + m_block_size_block - 1) // m_block_size_block
         expected_n_blocks = (seqlen_k + n_block_size - 1) // n_block_size
         block_sparse_tensors = normalize_block_sparse_tensors(
