@@ -122,7 +122,8 @@ def generate_block_mask_128(
         raise ValueError(f"sparsity must be in [0, 1), got {sparsity}")
 
     num_blocks = math.ceil(seq_len / BLOCK_USER)
-    num_q_pairs = (num_blocks + 1) // 2  # Q 方向的行对数量
+    # num_q_pairs = (num_blocks + 1) // 2  # Q 方向的行对数量
+    num_q_pairs = num_blocks
 
     # density = 1 - sparsity（被计算的比例）
     # sparsity 80% → density 20% → 只计算 20% 的 blocks
@@ -161,10 +162,10 @@ def generate_block_mask_128(
 
     # 扩展到 (batch_size, num_heads, num_blocks, num_blocks)
     # 每对行重复 2 次（第 2k 行和第 2k+1 行相同）
-    block_mask = pair_mask.repeat_interleave(2, dim=2)
+    # block_mask = pair_mask.repeat_interleave(2, dim=2)
 
     # 如果 num_blocks 是奇数，截断多余的行
-    block_mask = block_mask[:, :, :num_blocks, :]
+    block_mask = pair_mask[:, :, :num_blocks, :]
 
     return block_mask
 
@@ -568,9 +569,9 @@ def fa4_sparse_attention(
     
     # FA4 期望输入格式为 (B, S, H, D)，需要从 (B, H, S, D) 转换
     B, H, S, D = query.shape
-    q = query.transpose(1, 2).contiguous()  # (B, S, H, D)
-    k = key.transpose(1, 2).contiguous()
-    v = value.transpose(1, 2).contiguous()
+    q = query.transpose(1, 2)  # (B, S, H, D) only change layout
+    k = key.transpose(1, 2)
+    v = value.transpose(1, 2)
     
     with nvtx.annotate("fa4_fwd_kernel", color="yellow"):
         out, lse = _flash_attn_fwd(
@@ -584,12 +585,10 @@ def fa4_sparse_attention(
             mask_mod=None,  # 不使用 mask_mod，完全依赖 block_sparse_tensors
             block_sparse_tensors=block_sparse_tensors,
             aux_tensors=None,
-            return_lse=True,
+            return_lse=False,
         )
     
-    # 转换回 (B, H, S, D) 格式
-    out = out.transpose(1, 2).contiguous()
-    return out
+    return out.transpose(1, 2)
 
 
 @nvtx.annotate("flex_sparse_attention.forward", color="green")
@@ -855,7 +854,6 @@ def run_single_test(
         elif not FA4_AVAILABLE:
             print(colored("⚠️ FA4 not available, skipping FA4 accuracy test", "yellow"))
 
-        exit(0)
 
         # FlexAttention - 使用 compiled 版本避免 materialize full scores matrix
         if flex_mask_created and ref_output is not None:
@@ -1089,7 +1087,8 @@ def main() -> None:
             test_idx += 1
             # 使用 chunked reference，所有 case 都可以做精度测试
             case_run_accuracy = run_accuracy
-            
+            # print case and sparsity
+            print(colored(f"Test Case {test_idx}: B={batch_size}, S={seq_len}, H={num_heads}, D={head_dim}, Sparsity: {sparsity * 100:.0f}%", "cyan"))
             try:
                 summary = run_single_test(
                     batch_size=batch_size,

@@ -267,9 +267,7 @@ def _flash_attn_fwd(
             expected_count_shape=(batch_size, num_head, expected_m_blocks),
             expected_index_shape=(batch_size, num_head, expected_m_blocks, expected_n_blocks),
         )
-        sparse_tensors = to_cute_block_sparse_tensors(block_sparse_tensors)
-
-    use_block_sparsity = sparse_tensors is not None
+    use_block_sparsity = block_sparse_tensors is not None
 
     if mask_mod is None:
         if causal:
@@ -424,6 +422,8 @@ def _flash_attn_fwd(
         cute_aux_tensors = None
         if aux_tensors is not None:
             cute_aux_tensors = [from_dlpack(buf, enable_tvm_ffi=True).mark_layout_dynamic(leading_dim=buf.ndim - 1) for buf in aux_tensors]
+        # Only create cute block sparse tensors when compilation is needed
+        sparse_tensors = to_cute_block_sparse_tensors(block_sparse_tensors) if block_sparse_tensors is not None else None
 
         if compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
