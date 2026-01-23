@@ -1,3 +1,6 @@
+install:
+	pip install nvidia-cutlass-dsl apache-tvm-ffi torch-c-dlpack-ext
+
 tt:
 	PYTHONPATH=${PWD} python tests/cute/test_flash_attn.py
 

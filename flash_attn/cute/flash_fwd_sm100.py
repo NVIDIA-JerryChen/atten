@@ -198,9 +198,9 @@ class FlashAttentionForwardSm100:
         self.tmem_vec_offset = self.tmem_s_offset
 
         if self.head_dim_padded < 96:
-            self.num_regs_softmax = 200
-            self.num_regs_correction = 64
-            self.num_regs_other = 48
+            self.num_regs_softmax = 200 if self.q_stage == 2 else 256
+            self.num_regs_correction = 64 if self.q_stage == 2 else 128
+            self.num_regs_other = 48 if self.q_stage == 2 else 120
         else:
             # self.num_regs_softmax = 192 if self.is_causal or self.is_local else 184
             self.num_regs_softmax = 200 if self.q_stage == 2 else 256

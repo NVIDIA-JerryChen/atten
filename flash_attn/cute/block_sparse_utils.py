@@ -605,9 +605,10 @@ def produce_block_sparse_loads_sm100(
                     load_V=load_V,
                     pipeline_kv=pipeline_kv,
                 )
-    # only for kuaishou block sparse case and only full is supported
     if const_expr(q_stage == 1):
-        kv_producer_state = load_block_list_sm100(
+        if mask_empty:
+            # No masked blocks: process full list with Q loading
+            kv_producer_state = load_block_list_sm100(
                 curr_full_block_idx,
                 curr_full_block_cnt,
                 load_q_with_first=True,
@@ -618,8 +619,38 @@ def produce_block_sparse_loads_sm100(
                 load_K=load_K,
                 load_V=load_V,
                 pipeline_kv=pipeline_kv,
-        )
-        q_phase_flipped = not full_empty
+            )
+            q_phase_flipped = not full_empty
+        else:
+            # Process masked blocks with Q loading
+            kv_producer_state = load_block_list_sm100(
+                curr_mask_block_idx,
+                curr_mask_block_cnt,
+                load_q_with_first=True,
+                m_block=m_block,
+                q_stage=q_stage,
+                kv_producer_state=kv_producer_state,
+                load_Q=load_Q,
+                load_K=load_K,
+                load_V=load_V,
+                pipeline_kv=pipeline_kv,
+            )
+            q_phase_flipped = True
+
+            if not full_empty:
+                # Process full blocks without Q loading
+                kv_producer_state = load_block_list_sm100(
+                    curr_full_block_idx,
+                    curr_full_block_cnt,
+                    load_q_with_first=False,
+                    m_block=m_block,
+                    q_stage=q_stage,
+                    kv_producer_state=kv_producer_state,
+                    load_Q=load_Q,
+                    load_K=load_K,
+                    load_V=load_V,
+                    pipeline_kv=pipeline_kv,
+                )
     
     if q_phase_flipped:
         q_producer_phase ^= 1
@@ -871,12 +902,14 @@ def softmax_block_sparse_sm100(
                         full_n_block,
                         mask_fn=partial(mask_fn_none, mask_seqlen=False),
                     )
-        # only for kuaishou block sparse case and only full is supported
+        # only for kuaishou block sparse case
         elif const_expr(q_stage == 1):
             softmax_count = Int32(0)
-            if curr_full_block_cnt > 0:
+
+            # Process mask blocks first (if any)
+            if curr_mask_block_cnt > 0:
                 # First iteration with is_first=True and mask_seqlen=True
-                full_n_block = curr_full_block_idx[curr_full_block_cnt - 1]
+                mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1]
                 if softmax_count == 0:
                     (
                         mma_si_consumer_phase[0],
@@ -886,11 +919,11 @@ def softmax_block_sparse_sm100(
                         mma_si_consumer_phase[0],
                         si_corr_producer_phase,
                         s0_s1_sequence_phase,
-                        n_block=full_n_block,
+                        n_block=mask_n_block,
                         stage=0,
                         is_first=True,
                         tStSi=cute.make_tensor(tStS.iterator + tmem_s_offset[0], tStS.layout),
-                        mask_fn=partial(mask_fn_none, mask_seqlen=True),
+                        mask_fn=partial(mask_fn, mask_seqlen=True),
                     )
                 else:
                     (
@@ -901,15 +934,118 @@ def softmax_block_sparse_sm100(
                         mma_si_consumer_phase[1],
                         si_corr_producer_phase,
                         s0_s1_sequence_phase,
-                        n_block=full_n_block,
+                        n_block=mask_n_block,
                         stage=1,
                         is_first=True,
                         tStSi=cute.make_tensor(tStS.iterator + tmem_s_offset[1], tStS.layout),
-                        mask_fn=partial(mask_fn_none, mask_seqlen=True),
+                        mask_fn=partial(mask_fn, mask_seqlen=True),
                     )
                 softmax_count ^= 1
 
-                # Remaining iterations
+                # Remaining mask iterations
+                for i in cutlass.range(1, curr_mask_block_cnt):
+                    mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1 - i]
+                    if softmax_count == 0:
+                        (
+                            mma_si_consumer_phase[0],
+                            si_corr_producer_phase,
+                            s0_s1_sequence_phase,
+                        ) = softmax_step(
+                            mma_si_consumer_phase[0],
+                            si_corr_producer_phase,
+                            s0_s1_sequence_phase,
+                            n_block=mask_n_block,
+                            stage=0,
+                            tStSi=cute.make_tensor(tStS.iterator + tmem_s_offset[0], tStS.layout),
+                            mask_fn=partial(mask_fn, mask_seqlen=False),
+                        )
+                    else:
+                        (
+                            mma_si_consumer_phase[1],
+                            si_corr_producer_phase,
+                            s0_s1_sequence_phase,
+                        ) = softmax_step(
+                            mma_si_consumer_phase[1],
+                            si_corr_producer_phase,
+                            s0_s1_sequence_phase,
+                            n_block=mask_n_block,
+                            stage=1,
+                            tStSi=cute.make_tensor(tStS.iterator + tmem_s_offset[1], tStS.layout),
+                            mask_fn=partial(mask_fn, mask_seqlen=False),
+                        )
+                    softmax_count ^= 1
+
+            # Process full blocks
+            if curr_full_block_cnt > 0:
+                # First full block iteration - need to check if mask blocks were processed
+                full_n_block = curr_full_block_idx[curr_full_block_cnt - 1]
+                if curr_mask_block_cnt == 0:
+                    # No mask blocks were processed, this is the first block
+                    if softmax_count == 0:
+                        (
+                            mma_si_consumer_phase[0],
+                            si_corr_producer_phase,
+                            s0_s1_sequence_phase,
+                        ) = softmax_step(
+                            mma_si_consumer_phase[0],
+                            si_corr_producer_phase,
+                            s0_s1_sequence_phase,
+                            n_block=full_n_block,
+                            stage=0,
+                            is_first=True,
+                            tStSi=cute.make_tensor(tStS.iterator + tmem_s_offset[0], tStS.layout),
+                            mask_fn=partial(mask_fn_none, mask_seqlen=True),
+                        )
+                    else:
+                        (
+                            mma_si_consumer_phase[1],
+                            si_corr_producer_phase,
+                            s0_s1_sequence_phase,
+                        ) = softmax_step(
+                            mma_si_consumer_phase[1],
+                            si_corr_producer_phase,
+                            s0_s1_sequence_phase,
+                            n_block=full_n_block,
+                            stage=1,
+                            is_first=True,
+                            tStSi=cute.make_tensor(tStS.iterator + tmem_s_offset[1], tStS.layout),
+                            mask_fn=partial(mask_fn_none, mask_seqlen=True),
+                        )
+                else:
+                    # Mask blocks were processed, this is not the first block
+                    if softmax_count == 0:
+                        (
+                            mma_si_consumer_phase[0],
+                            si_corr_producer_phase,
+                            s0_s1_sequence_phase,
+                        ) = softmax_step(
+                            mma_si_consumer_phase[0],
+                            si_corr_producer_phase,
+                            s0_s1_sequence_phase,
+                            n_block=full_n_block,
+                            stage=0,
+                            is_first=False,
+                            tStSi=cute.make_tensor(tStS.iterator + tmem_s_offset[0], tStS.layout),
+                            mask_fn=partial(mask_fn_none, mask_seqlen=False),
+                        )
+                    else:
+                        (
+                            mma_si_consumer_phase[1],
+                            si_corr_producer_phase,
+                            s0_s1_sequence_phase,
+                        ) = softmax_step(
+                            mma_si_consumer_phase[1],
+                            si_corr_producer_phase,
+                            s0_s1_sequence_phase,
+                            n_block=full_n_block,
+                            stage=1,
+                            is_first=False,
+                            tStSi=cute.make_tensor(tStS.iterator + tmem_s_offset[1], tStS.layout),
+                            mask_fn=partial(mask_fn_none, mask_seqlen=False),
+                        )
+                softmax_count ^= 1
+
+                # Remaining full iterations
                 for i in cutlass.range(1, curr_full_block_cnt):
                     full_n_block = curr_full_block_idx[curr_full_block_cnt - 1 - i]
                     if softmax_count == 0:
