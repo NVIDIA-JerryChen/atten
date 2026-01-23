@@ -386,6 +386,10 @@ class AttentionMask:
             row_idx = tScS_t2r[0][0] + m_block * self.tile_m
             if const_expr(self.qhead_per_kvhead_packgqa != 1):
                 row_idx = row_idx // self.qhead_per_kvhead_packgqa
+            
+            # if const_expr(mask_causal): # no much perf gain 
+            #     for i in cutlass.range(cute.size(tScS_t2r), unroll_full=True):
+            #         acc_S[i] = -Float32.inf if tScS_t2r[i][1] >= tScS_t2r[i][0] else acc_S[i]
             if const_expr(mask_causal):
                 col_limit_right = row_idx + causal_row_offset
                 if const_expr(mask_seqlen):

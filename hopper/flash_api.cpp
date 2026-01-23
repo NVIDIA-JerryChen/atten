@@ -626,8 +626,8 @@ mha_fwd_get_scheduler_metadata(
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
     params.varlen_sort_batches = !params.is_local; // Use this value for Sort in scheduler template
     params.head_swizzle = params.is_causal || params.is_local; // Use this value for LPT in scheduler template
-    if (scheduler_needs_semaphore || use_prepare_varlen) {   
-        int b_rounded = round_multiple(params.b, 4); // for 16 byte alignment of pointers 
+    if (scheduler_needs_semaphore || use_prepare_varlen) {
+        int b_rounded = round_multiple(params.b, 4); // for 16 byte alignment of pointers
         int num_prepare_batch_vectors = use_prepare_varlen ? 2 : 0;
         if(params.varlen_sort_batches) { num_prepare_batch_vectors += 1; }
         if(params.head_swizzle) { num_prepare_batch_vectors += 1; }
@@ -696,6 +696,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         std::optional<at::Tensor> q_descale_,  // (b, h_k), not (b, h)
         std::optional<at::Tensor> k_descale_,  // (b, h_k)
         std::optional<at::Tensor> v_descale_,  // (b, h_k)
+        std::optional<at::Tensor> block_sparse_indices_,
+        int64_t block_sparse_blocksize_m,
+        int64_t block_sparse_blocksize_n,
         std::optional<double> softmax_scale_,
         bool is_causal,
         int64_t window_size_left,
@@ -928,6 +931,26 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     params.page_size = page_size;
     params.num_pages = num_pages;
 
+    if (block_sparse_indices_.has_value()) {
+        TORCH_CHECK(seqlen_q % 16 == 0, "seqlen_q should be a multiple of 16");
+        TORCH_CHECK(seqlen_k % 16 == 0, "seqlen_k should be a multiple of 16");
+
+        auto block_sparse_indices = block_sparse_indices_.value();
+        auto block_sparse_topk = block_sparse_indices.size(3);
+        CHECK_SHAPE(block_sparse_indices, batch_size, num_heads_k, (seqlen_q - 1) / block_sparse_blocksize_m + 1, block_sparse_topk);
+
+        params.block_sparse_indices = block_sparse_indices.data_ptr<int>();
+        params.block_sparse_topk = block_sparse_topk;
+
+        params.block_sparse_indices_batch_stride = block_sparse_indices.stride(0);
+        params.block_sparse_indices_head_stride = block_sparse_indices.stride(1);
+        params.block_sparse_indices_row_stride = block_sparse_indices.stride(2);
+
+        params.is_sparse = true;
+    } else {
+        params.is_sparse = false;
+    }
+
     if (k_new_.has_value()) {  // This needs to be set before get_pagedkv_tma
         at::Tensor k_new, v_new;
         TORCH_CHECK(v_new_.has_value(), "If k_new is supplied, v_new must also be passed in");
@@ -975,7 +998,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
             params.cu_seqlens_knew = static_cast<int*>(cu_seqlens_k_new.data_ptr());
         }
     }
-    
+
     bool const use_prepare_varlen = is_varlen;
     params.prepare_varlen_pdl = use_prepare_varlen && params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA;
     // Temporarily set num_splits_dynamic_ptr to 1 since get_num_splits checks it
@@ -1696,6 +1719,9 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor? q_descale = None,"
         "Tensor? k_descale = None,"
         "Tensor? v_descale = None,"
+        "Tensor? block_sparse_indices = None,"
+        "int block_sparse_blocksize_m = -1,"
+        "int block_sparse_blocksize_n = -1,"
         "float? softmax_scale = None,"
         "bool is_causal = False,"
         "int window_size_left = -1,"
