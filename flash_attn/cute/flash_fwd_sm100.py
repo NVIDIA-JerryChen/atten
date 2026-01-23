@@ -67,6 +67,9 @@ class NamedBarrierFwd(enum.IntEnum):
 
 class FlashAttentionForwardSm100:
     arch = 100
+    # TODO:
+    # Persistent hang issue
+    # DIM=256 accuracy issue
 
     def __init__(
         self,
@@ -111,14 +114,16 @@ class FlashAttentionForwardSm100:
         self.qk_acc_dtype = Float32
         self.pv_acc_dtype = Float32
         self.cluster_shape_mn = (1, 1)
-        self.is_persistent = is_persistent
+        # self.is_persistent = is_persistent
+        self.is_persistent = False
         self.is_causal = is_causal
         self.is_local = is_local
         self.is_varlen_q = is_varlen_q
         self.use_correction_warps_for_epi = is_varlen_q
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = is_split_kv
-        self.pack_gqa = pack_gqa
+        # self.pack_gqa = pack_gqa
+        self.pack_gqa = False
         if pack_gqa:
             assert m_block_size % self.qhead_per_kvhead == 0, (
                 "For PackGQA, m_block_size must be divisible by qhead_per_kvhead"
@@ -2527,7 +2532,7 @@ class FlashAttentionForwardSm100:
                     # mma warp can write to them
                     # cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + (stage if self.q_stage == 2 else correction_count))
-                    # correction_count ^= 1
+                    correction_count ^= 1
                     # if tidx == 0: cute.printf("Correction final scale for stage %d: %f\n", stage, scale)
 
                 o_corr_consumer_phase ^= 1

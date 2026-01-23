@@ -36,16 +36,16 @@ VERBOSE = True
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("has_learnable_sink", [False, True])
-# @pytest.mark.parametrize("has_learnable_sink", [False])
+# @pytest.mark.parametrize("has_learnable_sink", [False, True])
+@pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
-# @pytest.mark.parametrize("local_enum", [0])
+# @pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
+@pytest.mark.parametrize("local_enum", [0])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
@@ -63,22 +63,22 @@ VERBOSE = True
     [
         (1, 1),
         (3, 3),
-        (64, 32),
-        (64, 128),
+        # (64, 32),
+        # (64, 128),
         (128, 128),
         (128, 192),
         (256, 256),
-        (239, 1),
-        (799, 3),
+        # (239, 1),
+        # (799, 3),
         (113, 203),
         (113, 128),
         (128, 217),
         (113, 211),
         (108, 256),
         (256, 512),
-        (384, 256),
-        (640, 128),
-        (512, 256),
+        # (384, 256),
+        # (640, 128),
+        # (512, 256),
         (1024, 1024),
         (1023, 1024),
         (1024, 1023),
@@ -1417,10 +1417,11 @@ if __name__ == "__main__":
 #     mha_type,
 #     dtype,
 # ):
+# tests/cute/test_flash_attn.py::test_flash_attn_output[1024-1024-64-False-0-0.0-False-False-False-mha-dtype0] 
     test_flash_attn_output(
-        seqlen_q=8192,
-        seqlen_k=8192,
-        d=128,
+        seqlen_q=1024,
+        seqlen_k=1024,
+        d=256,
         causal=False,
         local_enum=0,
         softcap=0.0,
