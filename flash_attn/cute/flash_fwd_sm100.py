@@ -31,7 +31,7 @@ from flash_attn.cute.paged_kv import PagedKVManager
 import flash_attn.cute.utils as utils
 from flash_attn.cute import copy_utils
 import flash_attn.cute.pipeline as pipeline
-from flash_attn.cute.mask import AttentionMask
+from flash_attn.cute.mask import AttentionMask, mask_r2p
 from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
@@ -267,6 +267,7 @@ class FlashAttentionForwardSm100:
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        variable_block_sizes: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
@@ -670,6 +671,9 @@ class FlashAttentionForwardSm100:
             fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
 
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
+        self.use_variable_block_sizes = cutlass.const_expr(variable_block_sizes is not None)
+        if cutlass.const_expr(self.use_variable_block_sizes and not self.use_block_sparsity):
+            raise ValueError("variable_block_sizes requires block sparsity to be enabled")
         if cutlass.const_expr(self.use_block_sparsity and mPageTable is not None):
             raise NotImplementedError("Block sparsity + paged KV not supported on SM100")
 
@@ -695,6 +699,7 @@ class FlashAttentionForwardSm100:
             window_size_right,
             learnable_sink,
             blocksparse_tensors,
+            variable_block_sizes,
             sQ_layout,
             sK_layout,
             tP_layout,
@@ -740,6 +745,7 @@ class FlashAttentionForwardSm100:
         window_size_right: Optional[Int32],
         learnable_sink: Optional[cute.Tensor],
         blocksparse_tensors: Optional[BlockSparseTensors],
+        variable_block_sizes: Optional[cute.Tensor],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         tP_layout: cute.ComposedLayout,
@@ -1077,6 +1083,7 @@ class FlashAttentionForwardSm100:
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
                 blocksparse_tensors=blocksparse_tensors,
+                variable_block_sizes=variable_block_sizes,
             )
 
             if const_expr(not self.s0_s1_barrier or self.q_stage == 1):
@@ -1822,6 +1829,7 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        variable_block_sizes: Optional[cute.Tensor] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -1912,6 +1920,7 @@ class FlashAttentionForwardSm100:
                 seqlen=seqlen,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
+                variable_block_sizes=variable_block_sizes,
             )
 
             if has_work:
@@ -2213,6 +2222,7 @@ class FlashAttentionForwardSm100:
         fastdiv_mods=(None, None),
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
+        variable_block_sizes: Optional[cute.Tensor] = None,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -2293,6 +2303,10 @@ class FlashAttentionForwardSm100:
 
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block, thr_tmem_load=thr_tmem_load)
+        if cutlass.const_expr(self.use_variable_block_sizes):
+            var_col_limit = variable_block_sizes[n_block]
+            if var_col_limit < self.n_block_size:  # TODO: check perf here
+                mask_r2p(tSrS_t2r, var_col_limit, arch=100, rank1=True)
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
         if const_expr(not is_first):

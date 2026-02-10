@@ -35,12 +35,19 @@ class BlockSparseTensorsTorch(NamedTuple):
     mask_block_idx: torch.Tensor
     full_block_cnt: Optional[torch.Tensor] = None
     full_block_idx: Optional[torch.Tensor] = None
+    block_size: Optional[Tuple[int, int]] = None
+
+
+def ceildiv(a: int, b: int) -> int:
+    return (a + b - 1) // b
 
 
 def _expand_sparsity_tensor(
     tensor: torch.Tensor,
     expected_shape: Tuple[int, ...],
     tensor_name: str,
+    context: Optional[str] = None,
+    hint: Optional[Callable] = None,
 ) -> torch.Tensor:
     """Check if we need to expand the tensor to expected shape, and do so if possible."""
     needs_expand = tensor.shape != expected_shape
@@ -48,8 +55,12 @@ def _expand_sparsity_tensor(
         return tensor
     can_expand = all(map(lambda cur, tgt: cur == tgt or cur == 1, tensor.shape, expected_shape))
     if not can_expand:
+        context_clause = f" ({context})" if context else ""
+        resolved_hint = hint() if callable(hint) else hint
+        hint_clause = f" Hint: {resolved_hint}" if resolved_hint else ""
         raise ValueError(
-            f"{tensor_name} with shape {tensor.shape} cannot be expanded to expected shape {expected_shape}."
+            f"{tensor_name}{context_clause} with shape {tensor.shape} cannot be expanded to expected shape {expected_shape}."
+            f"{hint_clause}"
         )
     return tensor.expand(*expected_shape).contiguous()
 
@@ -60,6 +71,8 @@ def _check_and_expand_block(
     idx: Optional[torch.Tensor],
     expected_count_shape: Tuple[int, int, int],
     expected_index_shape: Tuple[int, int, int, int],
+    context: Optional[str] = None,
+    hint: Optional[Callable] = None,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     if (cnt is None) != (idx is None):
         raise ValueError(
@@ -73,8 +86,8 @@ def _check_and_expand_block(
         raise ValueError(f"{name}_block_cnt and {name}_block_idx must be on the same device")
     if not cnt.is_cuda or not idx.is_cuda:
         raise ValueError(f"{name}_block tensors must live on CUDA")
-    expanded_cnt = _expand_sparsity_tensor(cnt, expected_count_shape, f"{name}_block_cnt")
-    expanded_idx = _expand_sparsity_tensor(idx, expected_index_shape, f"{name}_block_idx")
+    expanded_cnt = _expand_sparsity_tensor(cnt, expected_count_shape, f"{name}_block_cnt", context, hint)
+    expanded_idx = _expand_sparsity_tensor(idx, expected_index_shape, f"{name}_block_idx", context, hint)
     return expanded_cnt, expanded_idx
 
 
@@ -83,19 +96,18 @@ def normalize_block_sparse_tensors(
     *,
     expected_count_shape: Tuple[int, int, int],
     expected_index_shape: Tuple[int, int, int, int],
+    context: Optional[str] = None,
+    hint: Optional[Callable] = None,
 ) -> BlockSparseTensorsTorch:
-    if tensors.mask_block_cnt is None or tensors.mask_block_idx is None:
-        raise ValueError("mask_block_cnt and mask_block_idx must be provided for block sparsity.")
-
     mask_cnt, mask_idx = _check_and_expand_block(
         "mask",
         tensors.mask_block_cnt,
         tensors.mask_block_idx,
         expected_count_shape,
         expected_index_shape,
+        context,
+        hint,
     )
-    if mask_cnt is None or mask_idx is None:
-        raise ValueError("mask_block_cnt and mask_block_idx must be provided for block sparsity.")
 
     full_cnt, full_idx = _check_and_expand_block(
         "full",
@@ -103,15 +115,32 @@ def normalize_block_sparse_tensors(
         tensors.full_block_idx,
         expected_count_shape,
         expected_index_shape,
+        context,
+        hint,
     )
-    if full_cnt is not None and mask_cnt.device != full_cnt.device:
+
+    if mask_cnt is None and full_cnt is None:
+        raise ValueError(
+            "At least one of (mask_block_cnt, mask_block_idx) or "
+            "(full_block_cnt, full_block_idx) must be provided for block sparsity."
+        )
+    if full_cnt is not None and mask_cnt is not None and mask_cnt.device != full_cnt.device:
         raise ValueError("All block sparse tensors must be on the same device")
+
+    # BlockSparseTensors (CUTE NamedTuple) requires mask_block_cnt/idx to always be
+    # valid tensors. When only full_block is provided, create zero-count mask tensors
+    # as placeholders (they will be skipped at runtime since count == 0).
+    ref_cnt = mask_cnt if mask_cnt is not None else full_cnt
+    if mask_cnt is None:
+        mask_cnt = torch.zeros(expected_count_shape, device=ref_cnt.device, dtype=torch.int32)
+        mask_idx = torch.zeros(expected_index_shape, device=ref_cnt.device, dtype=torch.int32)
 
     return BlockSparseTensorsTorch(
         mask_block_cnt=mask_cnt,
         mask_block_idx=mask_idx,
         full_block_cnt=full_cnt,
         full_block_idx=full_idx,
+        block_size=tensors.block_size,
     )
 
 
@@ -119,16 +148,127 @@ def is_block_sparsity_enabled(tensors: BlockSparseTensorsTorch) -> bool:
     return any(t is not None for t in (tensors.full_block_cnt, tensors.mask_block_cnt))
 
 
+def get_block_sparse_expected_shapes_bwd(
+    batch_size: int,
+    num_head: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    m_block_size: int,
+    n_block_size: int,
+    subtile_factor: int,
+) -> Tuple[Tuple[int, int, int], Tuple[int, int, int, int]]:
+    """Return (expected_count_shape, expected_index_shape) for backward block sparse normalization.
+
+    Backward uses Q-direction indexing (transposed from forward), where shapes are
+    indexed by N-blocks first, then M-blocks. The sparse_block_size_q is determined
+    by subtile_factor * m_block_size.
+    """
+    sparse_block_size_q = subtile_factor * m_block_size
+    expected_m_blocks = ceildiv(seqlen_q, sparse_block_size_q)
+    expected_n_blocks = ceildiv(seqlen_k, n_block_size)
+    expected_count_shape = (batch_size, num_head, expected_n_blocks)
+    expected_index_shape = (batch_size, num_head, expected_n_blocks, expected_m_blocks)
+    return expected_count_shape, expected_index_shape
+
+
+def get_block_sparse_broadcast_pattern(
+    tensors: BlockSparseTensorsTorch,
+) -> Optional[Tuple[Tuple[bool, ...], ...]]:
+    """Return broadcast pattern for block sparse tensors by checking actual strides.
+
+    Returns a tuple of broadcast patterns (one per tensor) where each pattern
+    is a tuple of bools indicating which dims have stride=0.
+    This is used in compile keys to ensure kernels are recompiled when
+    broadcast patterns change, since CuTe's mark_layout_dynamic() keeps
+    stride=0 as static.
+
+    The tensors should already be expanded/normalized before calling this function.
+
+    Returns None if block sparsity is not enabled.
+    """
+    if not is_block_sparsity_enabled(tensors):
+        return None
+
+    patterns = []
+    for tensor in (
+        tensors.mask_block_cnt,
+        tensors.mask_block_idx,
+        tensors.full_block_cnt,
+        tensors.full_block_idx,
+    ):
+        if tensor is not None:
+            patterns.append(tuple(s == 0 for s in tensor.stride()))
+        else:
+            patterns.append(None)
+    return tuple(patterns)
+
+
+def normalize_block_sparse_config_bwd(
+    tensors: BlockSparseTensorsTorch,
+    *,
+    batch_size: int,
+    num_head: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    block_size: Tuple[int, int],
+    subtile_factor: int,
+) -> Tuple[BlockSparseTensorsTorch, Optional[Tuple[Tuple[bool, ...], ...]]]:
+    """Normalize backward block sparse config. Returns (tensors, broadcast_pattern)."""
+    m_block_size, n_block_size = block_size
+    if tensors.block_size is None:
+        sparse_block_size_q, sparse_block_size_kv = subtile_factor * m_block_size, n_block_size
+    else:
+        sparse_block_size_q, sparse_block_size_kv = tensors.block_size
+    if sparse_block_size_q != subtile_factor * m_block_size:
+        raise ValueError(
+            f"Block sparsity expects sparse_block_size_q={subtile_factor * m_block_size} "
+            f"for subtile_factor={subtile_factor}."
+        )
+    if sparse_block_size_kv != n_block_size:
+        raise ValueError(
+            f"Block sparsity expects sparse_block_size[1]={n_block_size} to match tile_n."
+        )
+    expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes_bwd(
+        batch_size,
+        num_head,
+        seqlen_q,
+        seqlen_k,
+        m_block_size,
+        n_block_size,
+        subtile_factor,
+    )
+    normalized_tensors = normalize_block_sparse_tensors(
+        tensors,
+        expected_count_shape=expected_count_shape,
+        expected_index_shape=expected_index_shape,
+        context="_flash_attn_bwd",
+        hint=lambda: (
+            f"Backward expects Q-direction block-sparse tensors (q_mask_cnt/q_mask_idx, "
+            f"and optionally full_q_cnt/full_q_idx). Regenerate the backward BlockMask with "
+            f"BLOCK_SIZE=({subtile_factor * m_block_size}, {n_block_size})."
+        ),
+    )
+    return normalized_tensors, get_block_sparse_broadcast_pattern(normalized_tensors)
+
+
 def to_cute_block_sparse_tensors(tensors: BlockSparseTensorsTorch) -> Optional[BlockSparseTensors]:
     if not is_block_sparsity_enabled(tensors):
         return None
 
-    mask_block_cnt_tensor = from_dlpack(
-        tensors.mask_block_cnt.detach(), assumed_align=4
-    ).mark_layout_dynamic(leading_dim=2)
-    mask_block_idx_tensor = from_dlpack(
-        tensors.mask_block_idx.detach(), assumed_align=4
-    ).mark_layout_dynamic(leading_dim=3)
+    mask_block_cnt_tensor = (
+        from_dlpack(tensors.mask_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(
+            leading_dim=2
+        )
+        if tensors.mask_block_cnt is not None
+        else None
+    )
+    mask_block_idx_tensor = (
+        from_dlpack(tensors.mask_block_idx.detach(), assumed_align=4).mark_layout_dynamic(
+            leading_dim=3
+        )
+        if tensors.mask_block_idx is not None
+        else None
+    )
     full_block_cnt_tensor = (
         from_dlpack(tensors.full_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(
             leading_dim=2
