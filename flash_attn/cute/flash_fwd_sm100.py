@@ -1301,7 +1301,7 @@ class FlashAttentionForwardSm100:
                             kv_producer_state.advance()
                             load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Vi
                             kv_producer_state.advance()
-                    elif const_expr(self.q_stage == 1) and const_expr(mPageTable is None): 
+                    elif const_expr(self.q_stage == 1) and const_expr(mPageTable is None):
                         # prologue Q0 K0 K1
                         if const_expr(self.use_tma_KV) or tidx < cute.arch.WARP_SIZE:
                             load_Q(block=m_block, stage=0)  # Q0
@@ -1598,7 +1598,7 @@ class FlashAttentionForwardSm100:
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
     ):
-        assert self.q_stage == 1 
+        assert self.q_stage == 1
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
         tOrV = tiled_mma_pv.make_fragment_B(sV)
@@ -1660,7 +1660,7 @@ class FlashAttentionForwardSm100:
 
             if process_tile:
                 # prologue Q0K0, Q0K1
-                # wait for Q0 
+                # wait for Q0
                 cute.arch.mbarrier_wait(
                     mbar_ptr + self.mbar_load_q_full_offset, mma_q_consumer_phase
                 )
@@ -1701,7 +1701,7 @@ class FlashAttentionForwardSm100:
                     pipeline_kv.consumer_release(mma_kv_consumer_state)
                     mma_kv_consumer_state.advance()
                     bmm1_count ^= 1
-                
+
                 O_should_accumulate = False
                 for i in cutlass.range(block_iter_count - 2, unroll=1): # GEMM_P0V0, GEMM_QK2 ...-> GEMM_PiVi GEMM_QK(i+2)
                     # 1. wait for V0
@@ -1718,10 +1718,12 @@ class FlashAttentionForwardSm100:
                         # 3. gemm PiVi=Pi*Vi
                         gemm_Pi[0](tCrB=tOrVi, sB=sV_cur, zero_init=not O_should_accumulate, mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + 0, mbar_phase= P_full_O_rescaled_phase[0])
                         P_full_O_rescaled_phase[0] ^= 1
-                    else:   
+                    else:
                         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_P_full_O_rescaled_offset + 1, P_full_O_rescaled_phase[1])
                         gemm_Pi[1](tCrB=tOrVi, sB=sV_cur, zero_init=not O_should_accumulate, mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + 1, mbar_phase= P_full_O_rescaled_phase[1])
                         P_full_O_rescaled_phase[1] ^= 1
+                    with cute.arch.elect_one():
+                        tcgen05.commit(mbar_ptr + self.mbar_O_full_offset)
                     # 4. release Vi
                     pipeline_kv.consumer_release(mma_kv_release_state)
                     mma_kv_release_state.advance()
@@ -1749,7 +1751,7 @@ class FlashAttentionForwardSm100:
                 # release Q
                 with cute.arch.elect_one():
                     tcgen05.commit(mbar_ptr + self.mbar_load_q_empty_offset)
-                
+
                 # epilogue PxVx Px+1Vx+1
                 if block_iter_count > 1:
                     pipeline_kv.consumer_wait(mma_kv_consumer_state)
@@ -1766,11 +1768,13 @@ class FlashAttentionForwardSm100:
                         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_P_full_O_rescaled_offset + 1, P_full_O_rescaled_phase[1])
                         gemm_Pi[1](tCrB=tOrVi, sB=sV_cur, zero_init=not O_should_accumulate, mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + 1, mbar_phase=P_full_O_rescaled_phase[1])
                         P_full_O_rescaled_phase[1] ^= 1
+                    with cute.arch.elect_one():
+                        tcgen05.commit(mbar_ptr + self.mbar_O_full_offset)
                     pipeline_kv.consumer_release(mma_kv_consumer_state)
                     mma_kv_consumer_state.advance()
                     bmm2_count ^= 1
                     O_should_accumulate = True
-                
+
                 pipeline_kv.consumer_wait(mma_kv_consumer_state)
                 Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                 tOrVi = tOrV[None, None, None, Vi_index]
@@ -2062,9 +2066,9 @@ class FlashAttentionForwardSm100:
                     while n_block >= n_block_min_before_local_mask:
                         if const_expr(self.mask_mod is not None) and const_expr(self.q_stage == 2):
                             mma_si_consumer_phase[0], si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(
-                                mma_si_consumer_phase[0], 
-                                si_corr_producer_phase, 
-                                s0_s1_sequence_phase, 
+                                mma_si_consumer_phase[0],
+                                si_corr_producer_phase,
+                                s0_s1_sequence_phase,
                                 n_block,
                                 stage=stage,
                                 tStSi=tStSi,
@@ -2263,8 +2267,7 @@ class FlashAttentionForwardSm100:
         )
         thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP).get_slice(tidx)
         tStP_r2t = thr_tmem_store.partition_D(tStP)
-        
-        
+
         tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
         tScScale = cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
@@ -2449,7 +2452,8 @@ class FlashAttentionForwardSm100:
                         # if tidx == 0: cute.printf("Correction scale i = %d, for stage %d: %f, should_rescale = %d\n", i, stage, scale, should_rescale)
                         # Don't need O_full anymore, since by the time softmax has signaled the correction
                         # warps, S_i must have been done, so O_i-1 must have been done as well.
-                        # cute.arch.mbarrier_wait(mbar_ptr + self.mbar_O_full_offset + stage, o_corr_consumer_phase)
+                        if const_expr(self.q_stage == 1):
+                            cute.arch.mbarrier_wait(mbar_ptr + self.mbar_O_full_offset, o_corr_consumer_phase)
                         if should_rescale:
                             self.correction_rescale(
                                 thr_mma_pv, tOtOs[stage if self.q_stage == 2 else 0], tidx, scale
@@ -2460,7 +2464,7 @@ class FlashAttentionForwardSm100:
                         )
                     softmax_corr_consumer_phase ^= 1
                     correction_count ^= 1
-                    # o_corr_consumer_phase ^= 1
+                    o_corr_consumer_phase ^= 1
                 if const_expr(self.q_stage == 2):
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_empty_offset + 1)
                 # End of seqlen_corr_loop_steps
@@ -2787,7 +2791,7 @@ class FlashAttentionForwardSm100:
                 self.check_hdim_v_oob,
                 self.qhead_per_kvhead,
             )
-        
+
             # load acc O from smem to rmem for wider vectorization
             tOrO = cute.make_fragment_like(tOsO, self.o_dtype)
             cute.autovec_copy(tOsO, tOrO)
