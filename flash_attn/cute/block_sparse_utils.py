@@ -620,7 +620,51 @@ def produce_block_sparse_loads_sm100(
                 pipeline_kv=pipeline_kv,
         )
         q_phase_flipped = not full_empty
-    
+        # if mask_empty:
+        #     kv_producer_state = load_block_list_sm100(
+        #             curr_full_block_idx,
+        #             curr_full_block_cnt,
+        #             load_q_with_first=True,
+        #             m_block=m_block,
+        #             q_stage=q_stage,
+        #             kv_producer_state=kv_producer_state,
+        #             load_Q=load_Q,
+        #             load_K=load_K,
+        #             load_V=load_V,
+        #             pipeline_kv=pipeline_kv,
+        #     )
+        #     q_phase_flipped = not full_empty
+        # else:
+        #     # Process masked blocks with Q loading
+        #     kv_producer_state = load_block_list_sm100(
+        #         curr_mask_block_idx,
+        #         curr_mask_block_cnt,
+        #         load_q_with_first=True,
+        #         m_block=m_block,
+        #         q_stage=q_stage,
+        #         kv_producer_state=kv_producer_state,
+        #         load_Q=load_Q,
+        #         load_K=load_K,
+        #         load_V=load_V,
+        #         pipeline_kv=pipeline_kv,
+        #     )
+        #     q_phase_flipped = True
+
+        #     if not full_empty:
+        #         # Process full blocks without Q loading
+        #         kv_producer_state = load_block_list_sm100(
+        #             curr_full_block_idx,
+        #             curr_full_block_cnt,
+        #             load_q_with_first=False,
+        #             m_block=m_block,
+        #             q_stage=q_stage,
+        #             kv_producer_state=kv_producer_state,
+        #             load_Q=load_Q,
+        #             load_K=load_K,
+        #             load_V=load_V,
+        #             pipeline_kv=pipeline_kv,
+        #         )
+
     if q_phase_flipped:
         q_producer_phase ^= 1
 
